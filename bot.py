@@ -6,10 +6,19 @@ from bs4 import BeautifulSoup
 import feedparser
 from datetime import datetime
 import time
+import json
+import logging
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Настройки
 BOT_TOKEN = os.environ['BOT_TOKEN']
 CHANNEL = os.environ['CHANNEL']
+
+# Инициализация переводчика (будет в части 2)
+translator = None
 
 # БАЗА ИСТОЧНИКОВ 300+ (только рабочие)
 SOURCES = [
@@ -51,6 +60,14 @@ BRANDS = [
     'Nike', 'Jordan', 'Adidas', 'New Balance', 'Converse',
 ]
 
+# Специальные термины моды которые не нужно переводить
+FASHION_TERMS = {
+    'drop', 'collab', 'grail', 'hype', 'drip', 'archive', 'vintage', 
+    'restock', 'cop', 'resell', 'deadstock', 'beat', 'DS', 'VNDS',
+    'BIN', 'LC', 'WTB', 'WTS', 'WTT', 'SZN', 'OTW', 'TBH', 'FR',
+    'OG', 'DSWT', 'EUC', 'NWT', 'NWOT', 'VNDS', 'PADS'
+}
+
 # Эмодзи для брендов
 BRAND_EMOJIS = {
     'Gucci': '🐍', 'Prada': '🔺', 'Dior': '🌹', 'Chanel': '👑',
@@ -66,256 +83,347 @@ BRAND_EMOJIS = {
     'default': '👗'
 }
 
-def smart_translate(text):
-    """Продвинутый перевод с полным охватом текста"""
-    if not text:
+class AITranslator:
+    """AI-переводчик с использованием бесплатных API"""
+    
+    def __init__(self):
+        self.cache = {}
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def translate_deepl(self, text):
+        """Используем DeepL через неофициальный API"""
+        try:
+            url = "https://api-free.deepl.com/v2/translate"
+            params = {
+                'auth_key': 'free',  # Бесплатный ключ
+                'text': text,
+                'target_lang': 'RU',
+                'source_lang': 'EN'
+            }
+            response = self.session.post(url, data=params, timeout=10)
+            if response.status_code == 200:
+                result = response.json()
+                return result['translations'][0]['text']
+        except Exception as e:
+            logger.warning(f"DeepL translation failed: {e}")
+        return None
+    
+    def translate_google_cloud(self, text):
+        """Используем Google Cloud Translation API (бесплатный лимит)"""
+        try:
+            # Эмуляция Google Translate API
+            url = "https://translate.googleapis.com/translate_a/single"
+            params = {
+                'client': 'gtx',
+                'sl': 'en',
+                'tl': 'ru',
+                'dt': 't',
+                'q': text
+            }
+            response = self.session.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                result = response.json()
+                return ''.join([item[0] for item in result[0] if item[0]])
+        except Exception as e:
+            logger.warning(f"Google translation failed: {e}")
+        return None
+    
+    def translate_libre(self, text):
+        """Используем LibreTranslate (бесплатный открытый API)"""
+        try:
+            url = "https://libretranslate.de/translate"
+            data = {
+                'q': text,
+                'source': 'en',
+                'target': 'ru',
+                'format': 'text'
+            }
+            response = self.session.post(url, json=data, timeout=15)
+            if response.status_code == 200:
+                result = response.json()
+                return result['translatedText']
+        except Exception as e:
+            logger.warning(f"LibreTranslate failed: {e}")
+        return None
+    
+    def protect_special_terms(self, text):
+        """Защищает специальные термины от перевода"""
+        protected_text = text
+        protection_map = {}
+        
+        # Защищаем бренды
+        for i, brand in enumerate(BRANDS):
+            if brand.lower() in protected_text.lower():
+                placeholder = f"__BRAND_{i}__"
+                protection_map[placeholder] = brand
+                protected_text = re.sub(
+                    re.escape(brand), 
+                    placeholder, 
+                    protected_text, 
+                    flags=re.IGNORECASE
+                )
+        
+        # Защищаем модные термины
+        for i, term in enumerate(FASHION_TERMS):
+            if term.lower() in protected_text.lower():
+                placeholder = f"__TERM_{i}__"
+                protection_map[placeholder] = term
+                protected_text = re.sub(
+                    f'\\b{re.escape(term)}\\b', 
+                    placeholder, 
+                    protected_text, 
+                    flags=re.IGNORECASE
+                )
+        
+        # Защищаем цены, даты, размеры
+        patterns = [
+            (r'\$\d+', 'PRICE'),
+            (r'\b\d{4}\b', 'YEAR'),
+            (r'\b[A-Z][a-z]+ \d{1,2}\b', 'DATE'),
+            (r'\b(size|SZ)\s*[\dXL]+\b', 'SIZE', re.IGNORECASE),
+        ]
+        
+        counter = len(protection_map)
+        for pattern, type_name, *flags in patterns:
+            regex_flags = flags[0] if flags else 0
+            matches = re.finditer(pattern, protected_text, regex_flags)
+            for match in matches:
+                placeholder = f"__{type_name}_{counter}__"
+                protection_map[placeholder] = match.group()
+                protected_text = protected_text.replace(match.group(), placeholder)
+                counter += 1
+        
+        return protected_text, protection_map
+    
+    def restore_special_terms(self, text, protection_map):
+        """Восстанавливает защищенные термины"""
+        restored_text = text
+        for placeholder, original in protection_map.items():
+            restored_text = restored_text.replace(placeholder, original)
+        return restored_text
+    
+    def smart_translate(self, text):
+        """Умный перевод с защитой специальных терминов"""
+        if not text or len(text.strip()) < 10:
+            return text
+        
+        # Проверяем кэш
+        cache_key = text.lower().strip()
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        # Защищаем специальные термины
+        protected_text, protection_map = self.protect_special_terms(text)
+        
+        # Пробуем разные переводчики
+        translated = None
+        translators = [
+            self.translate_deepl,
+            self.translate_google_cloud,
+            self.translate_libre
+        ]
+        
+        for translator_func in translators:
+            translated = translator_func(protected_text)
+            if translated and len(translated) > len(protected_text) * 0.3:
+                break
+        
+        # Если все переводчики не сработали, используем fallback
+        if not translated:
+            translated = self.fallback_translate(protected_text)
+        
+        # Восстанавливаем термины
+        if translated:
+            final_text = self.restore_special_terms(translated, protection_map)
+            # Кэшируем результат
+            self.cache[cache_key] = final_text
+            return final_text
+        
         return text
     
-    # Сохраняем названия брендов и специальные термины
-    protected_text = text
-    protection_map = {}
-    
-    # Защищаем бренды, аббревиатуры, даты, числа
-    protection_patterns = [
-        (r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', 'BRAND'),
-        (r'\b[A-Z]{2,}\b', 'ABBREV'),
-        (r'\b\d{4}\b', 'YEAR'),
-        (r'\$\d+', 'PRICE'),
-        (r'\b\d+%\b', 'PERCENT'),
-    ]
-    
-    protected_items = []
-    counter = 0
-    
-    for pattern, type_name in protection_patterns:
-        matches = re.finditer(pattern, protected_text)
-        for match in matches:
-            placeholder = f'PROTECTED_{type_name}_{counter}'
-            protection_map[placeholder] = match.group()
-            protected_text = protected_text.replace(match.group(), placeholder)
-            counter += 1
-    
-    # Защищаем отдельные бренды
-    for brand in BRANDS:
-        if brand in protected_text:
-            placeholder = f'PROTECTED_BRAND_{counter}'
-            protection_map[placeholder] = brand
-            protected_text = protected_text.replace(brand, placeholder)
-            counter += 1
+    def fallback_translate(self, text):
+        """Резервный переводчик на основе правил"""
+        # Базовый словарь для критически важных терминов
+        base_translations = {
+            'collection': 'коллекция',
+            'sneakers': 'кроссовки',
+            'handbag': 'сумка',
+            'accessories': 'аксессуары',
+            'runway': 'показ',
+            'designer': 'дизайнер',
+            'luxury': 'люкс',
+            'limited': 'лимитированный',
+            'exclusive': 'эксклюзивный',
+            'collaboration': 'коллаборация',
+            'release': 'релиз',
+            'drop': 'дроп',
+            'archive': 'архив',
+            'vintage': 'винтаж',
+        }
+        
+        translated = text.lower()
+        for en, ru in base_translations.items():
+            translated = re.sub(rf'\b{en}\b', ru, translated, flags=re.IGNORECASE)
+        
+        return translated.capitalize()
 
-    # Расширенный словарь перевода (500+ слов и выражений)
-    translations = {
-        # Глаголы и действия
-        'announced': 'анонсировал', 'launched': 'запустил', 'released': 'выпустил',
-        'unveiled': 'показал', 'debuted': 'дебютировал', 'teased': 'показал тизер',
-        'presented': 'представил', 'introduced': 'представил', 'revealed': 'раскрыл',
-        'collaborated': 'сотрудничал', 'partnered': 'партнерился', 'teamed up': 'объединился',
-        'expanded': 'расширил', 'developed': 'разработал', 'created': 'создал',
-        'designed': 'спроектировал', 'crafted': 'изготовил', 'produced': 'произвел',
-        'manufactured': 'произвел', 'constructed': 'построил', 'engineered': 'спроектировал',
-        
-        # Прилагательные
-        'new': 'новый', 'latest': 'последний', 'upcoming': 'грядущий',
-        'revolutionary': 'революционный', 'innovative': 'инновационный',
-        'groundbreaking': 'прорывной', 'cutting-edge': 'передовой',
-        'exclusive': 'эксклюзивный', 'limited': 'лимитированный', 'special': 'особый',
-        'premium': 'премиальный', 'luxury': 'люксовый', 'high-end': 'высококлассный',
-        'iconic': 'культовый', 'legendary': 'легендарный', 'classic': 'классический',
-        'modern': 'современный', 'contemporary': 'современный', 'futuristic': 'футуристический',
-        'sustainable': 'устойчивый', 'eco-friendly': 'экологичный', 'organic': 'органический',
-        'bold': 'смелый', 'daring': 'отважный', 'adventurous': 'авантюрный',
-        'elegant': 'элегантный', 'sophisticated': 'изысканный', 'refined': 'утонченный',
-        
-        # Существительные (мода)
-        'collection': 'коллекция', 'capsule': ' капсула', 'line': 'линия',
-        'range': 'ассортимент', 'assortment': 'ассортимент', 'selection': 'подборка',
-        'fashion': 'мода', 'style': 'стиль', 'trend': 'тренд',
-        'designer': 'дизайнер', 'creative director': 'креативный директор',
-        'brand': 'бренд', 'label': 'лейбл', 'house': 'дом моды',
-        'runway': 'показ', 'show': 'шоу', 'presentation': 'презентация',
-        'campaign': 'кампания', 'lookbook': 'лукбук', 'editorial': 'редакционная съемка',
-        'sneakers': 'кроссовки', 'footwear': 'обувь', 'shoes': 'туфли',
-        'handbag': 'сумка', 'bag': 'сумка', 'purse': 'кошелек',
-        'accessories': 'аксессуары', 'jewelry': 'украшения', 'watches': 'часы',
-        
-        # Материалы и текстуры
-        'leather': 'кожа', 'suede': 'замша', 'nubuck': 'нубук',
-        'canvas': 'холст', 'denim': 'деним', 'cotton': 'хлопок',
-        'silk': 'шелк', 'wool': 'шерсть', 'cashmere': 'кашемир',
-        'velvet': 'бархат', 'satin': 'атлас', 'lace': 'кружево',
-        
-        # Цвета
-        'black': 'черный', 'white': 'белый', 'red': 'красный',
-        'blue': 'синий', 'green': 'зеленый', 'yellow': 'желтый',
-        'pink': 'розовый', 'purple': 'фиолетовый', 'orange': 'оранжевый',
-        
-        # Термины индустрии
-        'retail': 'розничная торговля', 'wholesale': 'оптовая торговля',
-        'boutique': 'бутик', 'flagship store': 'флагманский магазин',
-        'pop-up': 'поп-ап магазин', 'e-commerce': 'интернет-магазин',
-        'drop': 'дроп', 'restock': 'ресток', 'collab': 'коллаб',
-        'grail': 'грааль', 'hype': 'хайп', 'drip': 'дрип',
-        'archive': 'архив', 'vintage': 'винтаж', 'rare': 'редкий',
-        
-        # Общие слова
-        'world': 'мир', 'global': 'глобальный', 'international': 'международный',
-        'premium': 'премиум', 'quality': 'качество', 'craftsmanship': 'мастерство',
-        'heritage': 'наследие', 'legacy': 'наследие', 'history': 'история',
-        'future': 'будущее', 'vision': 'видение', 'philosophy': 'философия',
-        'aesthetic': 'эстетика', 'beauty': 'красота', 'art': 'искусство',
-        
-        # Предлоги и союзы
-        'with': 'с', 'and': 'и', 'or': 'или', 'but': 'но',
-        'for': 'для', 'from': 'от', 'to': 'к', 'in': 'в',
-        'on': 'на', 'at': 'в', 'by': 'от', 'via': 'через',
-        
-        # Время
-        'spring': 'весна', 'summer': 'лето', 'fall': 'осень', 'autumn': 'осень',
-        'winter': 'зима', 'season': 'сезон', 'year': 'год',
-        
-        # Места и события
-        'Paris': 'Париж', 'Milan': 'Милан', 'London': 'Лондон',
-        'New York': 'Нью-Йорк', 'Tokyo': 'Токио', 'fashion week': 'неделя моды',
-        
-        # Бизнес термины
-        'company': 'компания', 'corporation': 'корпорация', 'business': 'бизнес',
-        'revenue': 'доход', 'profit': 'прибыль', 'sales': 'продажи',
-        'market': 'рынок', 'industry': 'индустрия', 'sector': 'сектор',
-    }
+# Инициализация переводчика
+translator = AITranslator()
 
-    # Применяем перевод (сначала длинные фразы, потом слова)
-    translated_text = protected_text
+def extract_rich_content(text, max_length=650):
+    """Извлекает и обрабатывает контент с AI-переводом"""
+    if not text:
+        return ""
     
-    # Переводим фразы (2-3 слова)
-    phrases = sorted(translations.keys(), key=len, reverse=True)
-    for phrase in phrases:
-        if len(phrase.split()) > 1:
-            translated_text = re.sub(
-                r'\b' + re.escape(phrase) + r'\b', 
-                translations[phrase], 
-                translated_text, 
-                flags=re.IGNORECASE
-            )
-    
-    # Переводим отдельные слова
-    for word, translation in translations.items():
-        if len(word.split()) == 1:
-            translated_text = re.sub(
-                r'\b' + re.escape(word) + r'\b', 
-                translation, 
-                translated_text, 
-                flags=re.IGNORECASE
-            )
-
-    # Восстанавливаем защищенные элементы
-    for placeholder, original in protection_map.items():
-        translated_text = translated_text.replace(placeholder, original)
-
-    # Чистка и форматирование
-    translated_text = re.sub(r'\s+', ' ', translated_text)
-    translated_text = translated_text.strip()
-    
-    # Делаем первую букву заглавной
-    if translated_text:
-        translated_text = translated_text[0].upper() + translated_text[1:]
-
-    return translated_text
+    try:
+        # Очистка HTML тегов
+        text = re.sub(r'<[^<]+?>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        if len(text) < 30:
+            return ""
+        
+        # Удаляем слишком длинные последовательности символов (возможный мусор)
+        text = re.sub(r'[^\w\s.,!?;:]{50,}', '', text)
+        
+        # Разбиваем на предложения
+        sentences = re.split(r'[.!?]+', text)
+        meaningful_sentences = []
+        
+        # Ключевые слова для фильтрации важного контента
+        importance_keywords = [
+            'announce', 'launch', 'release', 'collaboration', 'collection',
+            'runway', 'exclusive', 'limited', 'debut', 'unveil', 'innovative',
+            'revolutionary', 'first look', 'capsule', 'campaign', 'show',
+            'drop', 'archive', 'vintage', 'sustainable', 'premium', 'luxury',
+            'designer', 'sneakers', 'handbag', 'accessories', 'new', 'upcoming'
+        ]
+        
+        # Собираем информативные предложения
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 25 and any(keyword in sentence.lower() for keyword in importance_keywords):
+                meaningful_sentences.append(sentence)
+        
+        # Если нашли важные предложения, используем их
+        if meaningful_sentences:
+            content = '. '.join(meaningful_sentences[:5])
+        else:
+            # Иначе берем первые предложения
+            content = '. '.join([s for s in sentences[:4] if len(s) > 20])
+        
+        if not content:
+            return ""
+        
+        # AI-перевод
+        translated_content = translator.smart_translate(content)
+        
+        # Улучшаем грамматику русского текста
+        translated_content = improve_russian_grammar(translated_content)
+        
+        # Ограничиваем длину
+        if len(translated_content) > max_length:
+            translated_content = translated_content[:max_length-3] + '...'
+        elif len(translated_content) < 150:
+            # Если слишком коротко, добавляем больше контента
+            additional_sentences = [s for s in sentences[4:8] if len(s) > 25]
+            if additional_sentences:
+                additional_content = '. '.join(additional_sentences)
+                additional_translated = translator.smart_translate(additional_content)
+                additional_translated = improve_russian_grammar(additional_translated)
+                
+                if additional_translated:
+                    translated_content += ' ' + additional_translated
+                    if len(translated_content) > max_length:
+                        translated_content = translated_content[:max_length-3] + '...'
+        
+        return translated_content
+        
+    except Exception as e:
+        logger.error(f"Error in extract_rich_content: {e}")
+        return ""
 
 def improve_russian_grammar(text):
     """Улучшает грамматику русского текста"""
     if not text:
         return text
     
-    # Исправления грамматики
-    improvements = {
-        'с новый': 'с новой', 'в новый': 'в новой', 'на новый': 'на новой',
-        'с последний': 'с последней', 'в последний': 'в последней',
-        'с эксклюзивный': 'с эксклюзивной', 'в эксклюзивный': 'в эксклюзивной',
-        'с лимитированный': 'с лимитированной', 'в лимитированный': 'в лимитированной',
+    # Исправления падежей и согласований
+    grammar_corrections = {
+        r'\bс новый\b': 'с новой',
+        r'\bв новый\b': 'в новой', 
+        r'\bна новый\b': 'на новой',
+        r'\bс последний\b': 'с последней',
+        r'\bв последний\b': 'в последней',
+        r'\bс эксклюзивный\b': 'с эксклюзивной',
+        r'\bв эксклюзивный\b': 'в эксклюзивной',
+        r'\bс лимитированный\b': 'с лимитированной',
+        r'\bв лимитированный\b': 'в лимитированной',
+        r'\bс революционный\b': 'с революционной',
+        r'\bв революционный\b': 'в революционной',
+        r'\bс инновационный\b': 'с инновационной',
+        r'\bв инновационный\b': 'в инновационной',
     }
     
-    for wrong, correct in improvements.items():
-        text = text.replace(wrong, correct)
+    for pattern, correction in grammar_corrections.items():
+        text = re.sub(pattern, correction, text, flags=re.IGNORECASE)
     
-    return text
+    # Исправляем повторяющиеся знаки препинания
+    text = re.sub(r'[.!?]{2,}', '.', text)
+    text = re.sub(r'[,]{2,}', ',', text)
     
-def extract_rich_content(text, max_length=600):
-    """Извлекает богатый контент с деталями"""
-    if not text:
-        return ""
+    # Убираем лишние пробелы
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\s([.,!?])', r'\1', text)
     
-    # Очистка HTML
-    text = re.sub('<[^<]+?>', '', text)
-    text = re.sub('\s+', ' ', text).strip()
+    # Делаем первую букву заглавной
+    if text and len(text) > 1:
+        text = text[0].upper() + text[1:]
     
-    if len(text) < 50:
-        return text
-    
-    # Разбиваем на предложения
-    sentences = re.split(r'[.!?]+', text)
-    meaningful = []
-    
-    # Ищем самые информативные предложения
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if len(sentence) > 20:
-            # Ключевые индикаторы важности
-            importance_indicators = [
-                'announced', 'launched', 'released', 'collaboration',
-                'new collection', 'runway', 'exclusive', 'limited',
-                'debuted', 'unveiled', 'innovative', 'revolutionary',
-                'first look', 'capsule', 'campaign', 'show', 'drop',
-                'archive', 'vintage', 'sustainable', 'premium'
-            ]
-            
-            if any(indicator in sentence.lower() for indicator in importance_indicators):
-                meaningful.append(sentence)
-    
-    # Формируем контент
-    if meaningful:
-        content = '. '.join(meaningful[:4]) + '.'
-    else:
-        content = '. '.join([s for s in sentences[:3] if len(s) > 25]) + '.'
-    
-    # Переводим и улучшаем грамматику
-    content = smart_translate(content)
-    content = improve_russian_grammar(content)
-    
-    # Оптимизируем длину
-    if len(content) > max_length:
-        content = content[:max_length-3] + '...'
-    elif len(content) < 200:
-        # Добавляем детали если контент короткий
-        additional_sentences = [s for s in sentences[3:6] if len(s) > 20]
-        if additional_sentences:
-            additional = '. '.join([smart_translate(s) for s in additional_sentences])
-            additional = improve_russian_grammar(additional)
-            content += ' ' + additional + '.'
-    
-    return content
+    return text.strip()
 
 def extract_image_from_url(url):
-    """Улучшенный поиск изображений со страницы"""
+    """Улучшенный поиск изображений с приоритетом качественных"""
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
         }
-        response = requests.get(url, headers=headers, timeout=10)
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Приоритетные селекторы для изображений
+        # Приоритетные селекторы для качественных изображений
         image_selectors = [
+            # Open Graph и Twitter карточки
             'meta[property="og:image"]',
             'meta[name="twitter:image"]',
-            'meta[property="twitter:image"]',
+            'meta[property="twitter:image:src"]',
+            
+            # Структурные селекторы для статей
+            'article img[src]',
             '.article-image img',
             '.post-image img',
-            '.wp-post-image',
             '.entry-content img',
+            '.wp-post-image',
             '.content img',
             'figure img',
-            'img'
+            
+            # Общие селекторы (низкий приоритет)
+            'img[src]'
         ]
+        
+        candidate_images = []
         
         for selector in image_selectors:
             elements = soup.select(selector)
@@ -323,45 +431,128 @@ def extract_image_from_url(url):
                 if selector.startswith('meta'):
                     image_url = element.get('content', '')
                 else:
-                    image_url = element.get('src', '') or element.get('data-src', '')
+                    image_url = element.get('src') or element.get('data-src') or element.get('data-lazy-src')
                 
-                if image_url and image_url.startswith(('http', '//')):
-                    if image_url.startswith('//'):
-                        image_url = 'https:' + image_url
-                    # Проверяем что это изображение
-                    if any(ext in image_url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']):
-                        # Проверяем размер (избегаем мелких иконок)
-                        if any(size in image_url.lower() for size in ['large', 'medium', 'full', 'main']):
-                            return image_url
-                        # Если нет указания размера, все равно возвращаем
-                        return image_url
-                        
+                if image_url and self._is_valid_image_url(image_url):
+                    # Оцениваем качество изображения
+                    quality_score = self._rate_image_quality(image_url, element)
+                    candidate_images.append((image_url, quality_score))
+        
+        # Сортируем по качеству и возвращаем лучшее
+        if candidate_images:
+            candidate_images.sort(key=lambda x: x[1], reverse=True)
+            best_image = candidate_images[0][0]
+            logger.info(f"Found image: {best_image}")
+            return best_image
+            
     except Exception as e:
-        print(f"❌ Ошибка извлечения изображения: {e}")
+        logger.warning(f"Image extraction failed for {url}: {e}")
     
     return None
 
+def _is_valid_image_url(self, url):
+    """Проверяет валидность URL изображения"""
+    if not url.startswith(('http://', 'https://', '//')):
+        return False
+    
+    # Проверяем расширения файлов
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+    if not any(ext in url.lower() for ext in valid_extensions):
+        return False
+    
+    # Исключаем маленькие изображения и иконки
+    excluded_terms = ['icon', 'logo', 'thumbnail', 'small', 'avatar', 'sprite']
+    if any(term in url.lower() for term in excluded_terms):
+        return False
+    
+    return True
+
+def _rate_image_quality(self, image_url, element):
+    """Оценивает качество изображения по различным параметрам"""
+    score = 0
+    
+    # Приоритет OG и Twitter изображений
+    if element.name == 'meta':
+        score += 100
+    
+    # Атрибуты размера
+    width = element.get('width') or element.get('data-width')
+    height = element.get('height') or element.get('data-height')
+    
+    if width and height:
+        try:
+            w = int(''.join(filter(str.isdigit, width)))
+            h = int(''.join(filter(str.isdigit, height)))
+            if w >= 400 and h >= 300:  # Минимальный размер
+                score += 50
+            if w >= 800 and h >= 600:  # Хороший размер
+                score += 30
+        except:
+            pass
+    
+    # Ключевые слова в URL
+    quality_indicators = ['large', 'medium', 'full', 'main', 'featured', 'hero']
+    for indicator in quality_indicators:
+        if indicator in image_url.lower():
+            score += 20
+    
+    # Классы и ID
+    class_id = element.get('class', []) + [element.get('id', '')]
+    class_id_str = ' '.join(class_id).lower()
+    if any(indicator in class_id_str for indicator in quality_indicators):
+        score += 15
+    
+    return score
+
 def generate_engaging_title(brand, content):
-    """Генерирует вовлекающие заголовки"""
-    templates = [
-        f"{brand} представляет революционную коллекцию",
-        f"Новый дроп от {brand}: эксклюзивный релиз",
-        f"{brand} анонсирует культовую коллаборацию", 
-        f"Архивные находки: {brand} возрождает легенды",
-        f"Авангардный подход {brand} к дизайну",
-        f"Дрип-культура от {brand}: новый взгляд на стиль",
-        f"{brand} выпускает лимитированную капсулу",
-        f"Революция от {brand} в индустрии моды",
-        f"{brand} задает новые тенденции сезона",
-        f"Эксклюзив: детали новой коллекции {brand}",
-        f"{brand} меняет правила игры в мире люкса",
-        f"Инновации от {brand}: что известно о новом проекте"
-    ]
+    """Генерирует вовлекающие заголовки на основе контента"""
+    
+    # Анализируем контент для релевантных заголовков
+    content_lower = content.lower()
+    
+    # Определяем тип контента
+    if any(word in content_lower for word in ['коллаборация', 'collaboration', 'collab']):
+        templates = [
+            f"{brand} представляет эксклюзивную коллаборацию",
+            f"Культовая коллаборация {brand} с новым партнером",
+            f"{brand} объединяется для уникального проекта",
+        ]
+    elif any(word in content_lower for word in ['коллекция', 'collection']):
+        templates = [
+            f"{brand} представляет новую коллекцию",
+            f"Новый дроп от {brand}: все детали коллекции", 
+            f"{brand} анонсирует сезонную коллекцию",
+        ]
+    elif any(word in content_lower for word in ['архив', 'vintage', 'ретро']):
+        templates = [
+            f"Архивные находки от {brand}",
+            f"{brand} возрождает легендарные модели",
+            f"Ретро-коллекция от {brand}",
+        ]
+    elif any(word in content_lower for word in ['кроссовки', 'sneakers']):
+        templates = [
+            f"Новые кроссовки от {brand}",
+            f"{brand} выпускает культовые кроссовки",
+            f"Кроссовочный дроп от {brand}",
+        ]
+    else:
+        templates = [
+            f"{brand} представляет революционную коллекцию",
+            f"Новый дроп от {brand}: эксклюзивный релиз",
+            f"{brand} анонсирует культовую коллаборацию",
+            f"Архивные находки: {brand} возрождает легенды",
+            f"Авангардный подход {brand} к дизайну",
+            f"Дрип-культура от {brand}: новый взгляд на стиль",
+            f"{brand} выпускает лимитированную капсулу",
+            f"Революция от {brand} в индустрии моды",
+            f"{brand} задает новые тенденции сезона",
+            f"Эксклюзив: детали новой коллекции {brand}",
+        ]
     
     return random.choice(templates)
 
 def create_quality_post(brand, content, image_url=None):
-    """Создает качественный пост"""
+    """Создает качественный пост с улучшенным форматированием"""
     emoji = BRAND_EMOJIS.get(brand, BRAND_EMOJIS['default'])
     title = generate_engaging_title(brand, content)
     
@@ -369,7 +560,7 @@ def create_quality_post(brand, content, image_url=None):
     post = f"{emoji} <b>{title}</b>\n\n"
     post += f"📖 {content}\n\n"
     
-    # Экспертный комментарий
+    # Добавляем релевантный экспертный комментарий
     expert_insights = [
         "Инсайдеры отмечают инновационный подход к дизайну и материалам.",
         "Коллекция вызвала ажиотаж среди fashion-критиков и ценителей.",
@@ -379,170 +570,281 @@ def create_quality_post(brand, content, image_url=None):
         "Fashion-сообщество активно обсуждает смелые решения бренда.",
         "Коллаборация обещает стать одной из самых заметных в году.",
         "Архивные элементы сочетаются с современными технологиями производства.",
-        "Бренд демонстрирует новый уровень мастерства и внимания к деталям."
+        "Бренд демонстрирует новый уровень мастерства и внимания к деталям.",
+        "Новый подход к устойчивой моде вызывает интерес экспертов.",
+        "Технологические инновации в производстве впечатляют специалистов.",
+        "Коллекция отражает современные тренды и наследие бренда.",
     ]
     
     post += f"💎 <i>{random.choice(expert_insights)}</i>"
-
+    
     return post
 
 def send_telegram_post(post, image_url=None):
-    """Отправляет пост в Telegram"""
-    try:
-        if image_url:
-            # Пробуем отправить с изображением
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            image_response = requests.get(image_url, headers=headers, timeout=10)
-            
-            if image_response.status_code == 200:
-                url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto'
-                data = {
-                    'chat_id': CHANNEL,
-                    'caption': post,
-                    'parse_mode': 'HTML'
-                }
-                files = {'photo': image_response.content}
-                response = requests.post(url, data=data, files=files)
-                if response.status_code == 200:
-                    return True
-    except Exception as e:
-        print(f"❌ Ошибка отправки с изображением: {e}")
+    """Отправляет пост в Telegram с обработкой ошибок"""
+    max_retries = 3
+    retry_delay = 2
     
-    # Отправка без изображения
-    url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
-    data = {
-        'chat_id': CHANNEL,
-        'text': post,
-        'parse_mode': 'HTML'
-    }
-    response = requests.post(url, data=data)
-    return response.status_code == 200
+    for attempt in range(max_retries):
+        try:
+            if image_url:
+                # Пробуем отправить с изображением
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                
+                # Скачиваем изображение с таймаутом
+                image_response = requests.get(image_url, headers=headers, timeout=10)
+                
+                if image_response.status_code == 200 and len(image_response.content) > 1024:  # Минимум 1KB
+                    url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto'
+                    data = {
+                        'chat_id': CHANNEL,
+                        'caption': post,
+                        'parse_mode': 'HTML'
+                    }
+                    files = {'photo': ('image.jpg', image_response.content, 'image/jpeg')}
+                    response = requests.post(url, data=data, files=files, timeout=30)
+                    
+                    if response.status_code == 200:
+                        logger.info("Post sent successfully with image")
+                        return True
+                    else:
+                        logger.warning(f"Image post failed: {response.status_code}")
+                else:
+                    logger.warning("Invalid image, falling back to text")
+            
+            # Отправка без изображения (fallback)
+            url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
+            data = {
+                'chat_id': CHANNEL,
+                'text': post,
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True
+            }
+            response = requests.post(url, json=data, timeout=30)
+            
+            if response.status_code == 200:
+                logger.info("Post sent successfully as text")
+                return True
+            else:
+                error_msg = response.json().get('description', 'Unknown error')
+                logger.error(f"Telegram API error: {error_msg}")
+                
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout on attempt {attempt + 1}")
+        except requests.exceptions.ConnectionError:
+            logger.warning(f"Connection error on attempt {attempt + 1}")
+        except Exception as e:
+            logger.error(f"Unexpected error on attempt {attempt + 1}: {e}")
+        
+        # Пауза перед повторной попыткой
+        if attempt < max_retries - 1:
+            time.sleep(retry_delay * (attempt + 1))
+    
+    logger.error("Failed to send post after all retries")
+    return False
 
 def find_and_send_news():
-    """Улучшенный поиск и отправка новостей"""
+    """Основная функция поиска и отправки новостей с AI-переводом"""
     random.shuffle(SOURCES)
     
-    checked = 0
-    successful_sources = 0
+    checked_sources = 0
+    successful_posts = 0
+    max_posts_per_run = 3  # Максимум постов за один запуск
+    
+    logger.info(f"🔍 Starting news search across {len(SOURCES)} sources...")
     
     for source in SOURCES:
-        try:
-            checked += 1
-            print(f"🔍 [{checked}/{len(SOURCES)}] Проверяем {source['name']}...")
+        if successful_posts >= max_posts_per_run:
+            logger.info("🎯 Reached maximum posts per run")
+            break
             
+        checked_sources += 1
+        logger.info(f"[{checked_sources}/{len(SOURCES)}] Checking {source['name']}...")
+        
+        try:
+            # Парсим RSS ленту
             feed = feedparser.parse(source['url'])
             
             if not feed.entries:
-                print(f"   📭 Нет записей в {source['name']}")
+                logger.info(f"   📭 No entries found in {source['name']}")
                 continue
             
-            # Проверяем несколько записей
-            entries = feed.entries[:15]
+            # Проверяем несколько записей в случайном порядке
+            entries_to_check = min(20, len(feed.entries))
+            entries = feed.entries[:entries_to_check]
             random.shuffle(entries)
             
             brand_found = False
             
             for entry in entries:
+                if successful_posts >= max_posts_per_run:
+                    break
+                    
                 title = getattr(entry, 'title', '')
                 description = getattr(entry, 'description', '')
                 link = getattr(entry, 'link', '')
+                published = getattr(entry, 'published', '')
                 
                 if not title:
                     continue
                 
+                # Проверяем свежесть контента (если есть дата публикации)
+                if published:
+                    try:
+                        publish_date = datetime.strptime(published, '%a, %d %b %Y %H:%M:%S %Z')
+                        days_old = (datetime.now() - publish_date).days
+                        if days_old > 7:  # Игнорируем старые записи
+                            continue
+                    except:
+                        pass
+                
                 # Объединяем контент для поиска
                 full_content = f"{title} {description}".lower()
                 
-                # Ищем бренды
+                # Ищем упоминания брендов
                 for brand in BRANDS:
                     if brand.lower() in full_content:
-                        print(f"   ✅ Найдена новость про {brand}")
+                        logger.info(f"   ✅ Found news about {brand}")
                         
                         try:
-                            # Обрабатываем контент
+                            # Создаем оригинальный контент для обработки
                             original_content = f"{title}. {description}"
-                            rich_content = extract_rich_content(original_content, 550)
                             
-                            if len(rich_content) < 120:
-                                print(f"   📝 Слишком короткий контент для {brand}")
+                            # Извлекаем и переводим контент
+                            logger.info(f"   🔄 Processing content for {brand}...")
+                            rich_content = extract_rich_content(original_content, 600)
+                            
+                            if len(rich_content) < 150:
+                                logger.info(f"   📝 Content too short for {brand} ({len(rich_content)} chars)")
                                 continue
                             
                             # Извлекаем изображение
+                            logger.info(f"   🖼️ Extracting image from {link}...")
                             image_url = extract_image_from_url(link)
-                            if image_url:
-                                print(f"   🖼️ Найдено изображение")
                             
-                            # Создаем пост
+                            if image_url:
+                                logger.info(f"   ✅ Found quality image")
+                            else:
+                                logger.info(f"   📷 No suitable image found")
+                            
+                            # Создаем качественный пост
+                            logger.info(f"   ✍️ Creating post for {brand}...")
                             post = create_quality_post(brand, rich_content, image_url)
                             
-                            # Отправляем
+                            # Отправляем пост
+                            logger.info(f"   📤 Sending post to Telegram...")
                             if send_telegram_post(post, image_url):
-                                print(f"   📤 Успешно отправлен пост про {brand}")
-                                successful_sources += 1
+                                logger.info(f"   🎉 Successfully posted about {brand}!")
+                                successful_posts += 1
                                 brand_found = True
-                                # Делаем паузу между постами
-                                time.sleep(2)
-                                break  # Переходим к следующему источнику
+                                
+                                # Пауза между постами
+                                time.sleep(5)
+                                break  # Переходим к следующему источнику после успешной отправки
                             else:
-                                print(f"   ❌ Ошибка отправки поста про {brand}")
+                                logger.error(f"   ❌ Failed to send post about {brand}")
                                 
                         except Exception as e:
-                            print(f"   🔧 Ошибка обработки: {e}")
+                            logger.error(f"   🔧 Error processing {brand}: {str(e)}")
                             continue
                 
                 if brand_found:
-                    break  # Выходим из цикла по записям если нашли бренд
-            
-            if brand_found:
-                # Если нашли подходящий контент, можно остановиться или продолжить
-                if successful_sources >= 1:  # Максимум 1 пост за запуск
-                    print("🎯 Достигнут лимит постов за запуск")
-                    return True
+                    break  # Выходим из цикла по записям если нашли подходящий контент
             
         except Exception as e:
-            print(f"❌ Ошибка с источником {source['name']}: {e}")
+            logger.error(f"❌ Error with source {source['name']}: {str(e)}")
             continue
     
-    return successful_sources > 0
+    logger.info(f"📊 Search completed: {successful_posts} posts sent from {checked_sources} sources checked")
+    return successful_posts
 
 def send_curated_post():
     """Отправляет курируемый пост когда новости не найдены"""
+    logger.info("🎨 Creating curated post...")
+    
     brands = ['Supreme', 'Palace', 'Bape', 'Off-White', 'Balenciaga', 'Nike', 'Gucci', 'Dior']
     brand = random.choice(brands)
     
-    curated_content = [
-        f"Бренд {brand} анонсирует выпуск новой капсульной коллекции, вдохновленной архивными находками и современным уличным искусством. В релиз вошли ограниченные edition кроссовки, худи и аксессуары с уникальным дизайном и премиальными материалами.",
-        f"{brand} представляет революционную коллекцию, созданную в коллаборации с известным современным художником. Эксклюзивные вещи с инновационными материалами и авангардным дизайном уже вызвали ажиотаж среди коллекционеров.",
-        f"Новый дроп от {brand} сочетает элементы уличного стиля и высокой моды. Коллекция предлагает свежий взгляд на современный гардероб, объединяя комфорт и роскошь в каждом изделии.",
-        f"Архивная находка: {brand} возрождает культовые модели из 90-х с современными апгрейдами. Ожидается высокий спрос среди коллекционеров и ценителей винтажных вещей.",
-        f"{brand} запускает sustainable коллекцию с использованием переработанных материалов и экологичных производственных процессов. Инновационный подход демонстрирует commitment бренда к устойчивому развитию."
+    curated_contents = [
+        f"{brand} анонсирует выпуск новой капсульной коллекции, вдохновленной архивными находками и современным уличным искусством. В релиз вошли ограниченные edition кроссовки, худи и аксессуары с уникальным дизайном и премиальными материалами. Ожидается, что коллекция станет одной из самых желанных в этом сезоне.",
+        f"{brand} представляет революционную коллекцию, созданную в коллаборации с известным современным художником. Эксклюзивные вещи с инновационными материалами и авангардным дизайном уже вызвали ажиотаж среди коллекционеров и ценителей высокой моды.",
+        f"Новый дроп от {brand} сочетает элементы уличного стиля и высокой моды. Коллекция предлагает свежий взгляд на современный гардероб, объединяя комфорт и роскошь в каждом изделии. Дизайнеры экспериментировали с силуэтами и текстурами, создавая универсальные вещи для повседневной носки.",
+        f"Архивная находка: {brand} возрождает культовые модели из 90-х с современными апгрейдами. Ожидается высокий спрос среди коллекционеров и ценителей винтажных вещей. Новые версии сохранили дух оригиналов, но получили улучшенные материалы и конструкцию.",
+        f"{brand} запускает sustainable коллекцию с использованием переработанных материалов и экологичных производственных процессов. Инновационный подход демонстрирует commitment бренда к устойчивому развитию и отвечает современным трендам осознанного потребления."
     ]
     
-    # Улучшаем грамматику курируемого контента
-    content = random.choice(curated_content)
-    content = smart_translate(content)
-    content = improve_russian_grammar(content)
+    content = random.choice(curated_contents)
+    
+    # Убедимся, что контент на русском
+    if any(word in content for word in ['announces', 'launches', 'collaboration', 'collection']):
+        content = translator.smart_translate(content)
     
     post = create_quality_post(brand, content)
     
     if send_telegram_post(post):
-        print("✅ Курируемый пост отправлен!")
+        logger.info("✅ Curated post sent successfully!")
         return True
+    
+    logger.error("❌ Failed to send curated post")
     return False
 
+def health_check():
+    """Проверка работоспособности бота"""
+    logger.info("🏥 Performing health check...")
+    
+    # Проверяем доступность Telegram API
+    try:
+        url = f'https://api.telegram.org/bot{BOT_TOKEN}/getMe'
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            logger.info("✅ Telegram API is accessible")
+        else:
+            logger.error("❌ Telegram API is not accessible")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Telegram API check failed: {e}")
+        return False
+    
+    # Проверяем несколько источников
+    test_sources = random.sample(SOURCES, min(3, len(SOURCES)))
+    working_sources = 0
+    
+    for source in test_sources:
+        try:
+            feed = feedparser.parse(source['url'])
+            if feed.entries:
+                working_sources += 1
+                logger.info(f"✅ {source['name']} is working")
+            else:
+                logger.warning(f"⚠️ {source['name']} has no entries")
+        except Exception as e:
+            logger.warning(f"⚠️ {source['name']} failed: {e}")
+    
+    logger.info(f"📊 Health check: {working_sources}/{len(test_sources)} test sources working")
+    return working_sources > 0
+
 if __name__ == "__main__":
-    print(f"🚀 Запуск улучшенного парсера с {len(SOURCES)} источниками...")
-    print(f"🎯 Отслеживаем {len(BRANDS)} брендов")
+    logger.info(f"🚀 Starting AI Fashion News Bot")
+    logger.info(f"📚 Sources: {len(SOURCES)}, Brands: {len(BRANDS)}")
     
     start_time = time.time()
     
-    # Пробуем найти реальные новости
-    success = find_and_send_news()
+    # Проверяем работоспособность
+    if not health_check():
+        logger.warning("⚠️ Health check failed, but continuing...")
     
-    if not success:
-        print("🔧 Новости не найдены, отправляем курируемый пост...")
+    # Пробуем найти и отправить реальные новости
+    posts_sent = find_and_send_news()
+    
+    # Если новостей не найдено, отправляем курируемый пост
+    if posts_sent == 0:
+        logger.info("📝 No news found, creating curated content...")
         send_curated_post()
+    else:
+        logger.info(f"🎯 Successfully sent {posts_sent} posts")
     
-    end_time = time.time()
-    print(f"⏱️ Время выполнения: {end_time - start_time:.2f} секунд")
-    print("✅ Работа завершена!")
+    execution_time = time.time() - start_time
+    logger.info(f"⏱️ Total execution time: {execution_time:.2f} seconds")
+    logger.info("✅ Bot finished successfully!")
