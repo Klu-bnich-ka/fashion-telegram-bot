@@ -1,0 +1,23 @@
+name: Telegram Fashion Bot
+
+on:
+  schedule:
+    - cron: '0 */2 * * *'  # Каждые 2 часа
+  workflow_dispatch:  # Запуск вручную
+
+jobs:
+  send-news:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install feedparser requests
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL: ${{ secrets.CHANNEL }}
+        run: python bot.py
