@@ -1,179 +1,201 @@
-import feedparser
 import requests
-import random
 import os
 import re
+import random
+from bs4 import BeautifulSoup
+import feedparser
+from datetime import datetime
 
-# Настройки из переменных окружения
+# Настройки
 BOT_TOKEN = os.environ['BOT_TOKEN']
 CHANNEL = os.environ['CHANNEL']
 
-# Английские RSS-ленты которые РАБОТАЮТ и содержат luxury контент
-RSS_FEEDS = [
-    'https://www.vogue.com/rss',                          # Vogue Global
-    'https://www.harpersbazaar.com/feed/rss/',           # Harper's Bazaar
-    'https://wwd.com/feed/',                             # Women's Wear Daily
-    'https://www.businessoffashion.com/feed',            # Business of Fashion
-    'https://www.thecut.com/rss/index.xml'               # The Cut (NYMag)
+# Русские СМИ для парсинга
+SOURCES = [
+    {'name': 'РБК', 'url': 'https://www.rbc.ru/rbcfreenews/', 'category': 'style'},
+    {'name': 'Коммерсант', 'url': 'https://www.kommersant.ru/RSS/news.xml', 'category': 'lifestyle'},
+    {'name': 'Forbes', 'url': 'https://www.forbes.ru/newrss.xml', 'category': 'lifestyle'},
+    {'name': 'Buro 24/7', 'url': 'https://www.buro247.ru/news/fashion/', 'category': 'fashion'}
 ]
 
-# Ключевые слова luxury брендов на английском
-LUXURY_BRANDS = [
-    'Raf Simons', 'Yves Saint Laurent', 'YSL', 'Gucci', 'Prada', 'Dior', 
-    'Chanel', 'Louis Vuitton', 'Balenciaga', 'Versace', 'Hermes', 'Cartier',
-    'Valentino', 'Fendi', 'Dolce & Gabbana', 'Bottega Veneta', 'Loewe',
-    'Off-White', 'Rick Owens', 'Balmain', 'Givenchy', 'Burberry', 'Tom Ford'
-]
+def translate_keywords(text):
+    """Перевод ключевых модных терминов"""
+    translations = {
+        'fashion': 'мода', 'style': 'стиль', 'trend': 'тренд', 'collection': 'коллекция',
+        'designer': 'дизайнер', 'luxury': 'люкс', 'runway': 'показ', 'model': 'модель',
+        'brand': 'бренд', 'new': 'новый', 'exclusive': 'эксклюзив'
+    }
+    for eng, rus in translations.items():
+        text = re.sub(r'\b' + eng + r'\b', rus, text, flags=re.IGNORECASE)
+    return text
 
-# Эмодзи для брендов
-BRAND_EMOJIS = {
-    'chanel': '👑', 'dior': '🌹', 'gucci': '🐍', 'prada': '🔺', 
-    'louis vuitton': '🧳', 'balenciaga': '👟', 'versace': '🌞', 
-    'yves saint laurent': '💄', 'raf simons': '🎨', 'off-white': '🟨',
-    'hermes': '🟠', 'default': '👗'
-}
+def extract_article_content(url):
+    """Парсит полный текст статьи с картинкой"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Извлекаем заголовок
+        title = soup.find('h1')
+        title = title.get_text().strip() if title else "Без названия"
+        
+        # Извлекаем картинку
+        image = soup.find('meta', property='og:image')
+        image_url = image['content'] if image else None
+        
+        # Извлекаем основной текст (первые 2 абзаца)
+        content = ""
+        paragraphs = soup.find_all('p')[:3]
+        for p in paragraphs:
+            text = p.get_text().strip()
+            if len(text) > 50:  # Только значимые абзацы
+                content += text + "\n\n"
+        
+        return {
+            'title': title,
+            'content': content[:500] + '...' if len(content) > 500 else content,
+            'image': image_url,
+            'url': url
+        }
+    except Exception as e:
+        print(f"❌ Ошибка парсинга: {e}")
+        return None
 
-# Простой перевод ключевых фраз (для заголовков)
-TRANSLATIONS = {
-    'collection': 'коллекция',
-    'fashion': 'мода',
-    'runway': 'показ',
-    'designer': 'дизайнер',
-    'luxury': 'люкс',
-    'new': 'новый',
-    'trend': 'тренд',
-    'style': 'стиль'
-}
-
-def get_brand_emoji(text):
-    """Возвращает эмодзи для бренда"""
-    if not text:
-        return BRAND_EMOJIS['default']
+def create_beautiful_post(article, source_name):
+    """Создает красивый пост в стиле 'Топор'"""
     
-    text_lower = text.lower()
-    for brand, emoji in BRAND_EMOJIS.items():
-        if brand in text_lower:
-            return emoji
-    return BRAND_EMOJIS['default']
-
-def contains_luxury_brand(text):
-    """Проверяет содержит ли текст упоминание luxury бренда"""
-    if not text:
-        return False
-    text_lower = text.lower()
-    return any(brand.lower() in text_lower for brand in LUXURY_BRANDS)
-
-def clean_html(text):
-    """Очищает HTML теги из текста"""
-    if not text:
-        return ""
-    return re.sub('<[^<]+?>', '', text)
-
-def simple_translate(text):
-    """Простой перевод ключевых слов в тексте"""
-    if not text:
-        return text
+    # Эмодзи для разных категорий
+    emojis = {
+        'fashion': '👗', 'style': '💎', 'business': '📈', 
+        'lifestyle': '🌟', 'news': '📰'
+    }
     
-    result = text
-    for eng, rus in TRANSLATIONS.items():
-        result = re.sub(r'\b' + eng + r'\b', rus, result, flags=re.IGNORECASE)
-    return result
+    emoji = emojis.get('fashion', '📌')
+    
+    # Перевод заголовка
+    title = translate_keywords(article['title'])
+    
+    # Форматируем пост
+    post = f"{emoji} <b>{title}</b>\n\n"
+    
+    if article['content']:
+        post += f"📖 {article['content']}\n\n"
+    
+    # Добавляем источник и время
+    post += f"📰 <i>{source_name}</i>\n"
+    post += f"🕒 {datetime.now().strftime('%H:%M')}\n\n"
+    
+    # Хештеги
+    post += "#мода #тренды #новости #стиль"
+    
+    # Добавляем брендовые хештеги если есть в тексте
+    brands = ['gucci', 'dior', 'chanel', 'prada', 'balenciaga', 'versace']
+    title_lower = title.lower()
+    for brand in brands:
+        if brand in title_lower:
+            post += f" #{brand}"
+    
+    return post, article['image']
 
-def send_news():
-    for rss_url in RSS_FEEDS:
+def send_telegram_post(text, image_url=None):
+    """Отправляет пост в Telegram"""
+    if image_url:
+        # Пробуем отправить с картинкой
+        url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto'
+        data = {
+            'chat_id': CHANNEL,
+            'caption': text,
+            'parse_mode': 'HTML'
+        }
+        files = {'photo': requests.get(image_url).content}
+        response = requests.post(url, data=data, files=files)
+    else:
+        # Без картинки
+        url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
+        data = {
+            'chat_id': CHANNEL,
+            'text': text,
+            'parse_mode': 'HTML'
+        }
+        response = requests.post(url, data=data)
+    
+    return response.status_code == 200
+
+def find_fashion_news():
+    """Ищет модные новости в RSS лентах"""
+    for source in SOURCES:
         try:
-            print(f"🔍 Проверяем: {rss_url}")
+            print(f"🔍 Проверяем {source['name']}...")
             
-            feed = feedparser.parse(rss_url)
+            # Парсим RSS
+            feed = feedparser.parse(source['url'])
             
             if not feed.entries:
-                print("❌ Нет новостей в этой ленте")
                 continue
-                
-            # Ищем новости про luxury бренды
-            luxury_entries = []
-            for entry in feed.entries[:15]:  # Проверяем больше новостей
-                title = getattr(entry, 'title', '')
-                description = getattr(entry, 'description', '')
-                
-                if contains_luxury_brand(title) or contains_luxury_brand(description):
-                    luxury_entries.append(entry)
             
-            if luxury_entries:
-                # Берем случайную новость про бренды
-                entry = random.choice(luxury_entries)
-                emoji = get_brand_emoji(entry.title + ' ' + getattr(entry, 'description', ''))
+            # Ищем подходящие статьи
+            for entry in feed.entries[:5]:
+                title = getattr(entry, 'title', '')
+                link = getattr(entry, 'link', '')
                 
-                # "Переводим" заголовок
-                title = clean_html(entry.title)
-                russian_title = simple_translate(title)
+                # Ключевые слова для фильтрации
+                keywords = ['мода', 'стиль', 'дизайнер', 'коллекция', 'показ', 
+                           'Gucci', 'Dior', 'Chanel', 'Prada', 'бренд']
                 
-                message = f"{emoji} {russian_title}\n\n"
-                
-                if hasattr(entry, 'description'):
-                    desc = clean_html(entry.description)
-                    desc = desc[:200] + '...' if len(desc) > 200 else desc
-                    message += f"{desc}\n\n"
-                
-                message += f"🔗 {entry.link}\n"
-                message += "#мода #luxury #бренды #тренды"
-                
-                # Добавляем хештеги брендов
-                title_lower = title.lower()
-                brand_hashtags = {
-                    'gucci': 'Gucci', 'dior': 'Dior', 'chanel': 'Chanel', 
-                    'prada': 'Prada', 'balenciaga': 'Balenciaga', 'versace': 'Versace',
-                    'ysl': 'YSL', 'raf simons': 'RafSimons'
-                }
-                
-                for brand_key, brand_tag in brand_hashtags.items():
-                    if brand_key in title_lower:
-                        message += f" #{brand_tag}"
-                
-                # Отправляем в канал
-                url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
-                data = {'chat_id': CHANNEL, 'text': message, 'parse_mode': 'HTML'}
-                
-                response = requests.post(url, data=data)
-                if response.status_code == 200:
-                    print(f"✅ ОТПРАВЛЕНО: {title}")
-                    return True
-                else:
-                    print(f"❌ Ошибка отправки: {response.text}")
-            else:
-                print(f"❌ Не найдено новостей про luxury бренды в {rss_url}")
+                if any(keyword.lower() in title.lower() for keyword in keywords):
+                    print(f"✅ Найдена подходящая новость: {title}")
+                    
+                    # Парсим полную статью
+                    article = extract_article_content(link)
+                    if article and article['content']:
+                        # Создаем красивый пост
+                        post_text, image_url = create_beautiful_post(article, source['name'])
                         
+                        # Отправляем в канал
+                        if send_telegram_post(post_text, image_url):
+                            print(f"✅ Пост отправлен: {title}")
+                            return True
+            
         except Exception as e:
-            print(f"❌ Ошибка: {e}")
+            print(f"❌ Ошибка с {source['name']}: {e}")
     
-    # Резервный вариант - любая модная новость
-    print("🔄 Пробуем резервный вариант...")
-    for rss_url in RSS_FEEDS:
+    return False
+
+def send_backup_news():
+    """Резервный вариант - любая интересная новость"""
+    backup_feeds = [
+        'https://lenta.ru/rss/news',
+        'https://www.vedomosti.ru/rss/news',
+        'https://www.rbc.ru/rbcfreenews/'
+    ]
+    
+    for feed_url in backup_feeds:
         try:
-            feed = feedparser.parse(rss_url)
+            feed = feedparser.parse(feed_url)
             if feed.entries:
                 entry = feed.entries[0]
-                emoji = random.choice(['👗', '👠', '👜'])
                 
-                title = clean_html(entry.title)
-                russian_title = simple_translate(title)
+                # Создаем простой пост
+                title = translate_keywords(entry.title)
+                post = f"📌 <b>{title}</b>\n\n"
+                post += f"🔗 {entry.link}\n\n"
+                post += "#новости #тренды #актуальное"
                 
-                message = f"{emoji} {russian_title}\n\n"
-                message += f"🔗 {entry.link}\n"
-                message += "#мода #новости #тренды"
-                
-                url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage'
-                data = {'chat_id': CHANNEL, 'text': message, 'parse_mode': 'HTML'}
-                
-                response = requests.post(url, data=data)
-                if response.status_code == 200:
-                    print(f"✅ ОТПРАВЛЕНО (резерв): {title}")
+                if send_telegram_post(post):
+                    print(f"✅ Резервный пост отправлен: {title}")
                     return True
         except:
             continue
     
-    print("❌ Не удалось отправить ни одну новость")
     return False
 
 if __name__ == "__main__":
-    send_news()
+    print("🚀 Запуск парсера модных новостей...")
+    
+    # Пробуем найти модные новости
+    if not find_fashion_news():
+        print("❌ Модные новости не найдены, пробуем резерв...")
+        send_backup_news()
