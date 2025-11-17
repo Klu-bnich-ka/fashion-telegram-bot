@@ -433,9 +433,9 @@ def extract_image_from_url(url):
                 else:
                     image_url = element.get('src') or element.get('data-src') or element.get('data-lazy-src')
                 
-                if image_url and self._is_valid_image_url(image_url):
+                if image_url and is_valid_image_url(image_url):
                     # Оцениваем качество изображения
-                    quality_score = self._rate_image_quality(image_url, element)
+                    quality_score = rate_image_quality(image_url, element)
                     candidate_images.append((image_url, quality_score))
         
         # Сортируем по качеству и возвращаем лучшее
@@ -450,7 +450,7 @@ def extract_image_from_url(url):
     
     return None
 
-def _is_valid_image_url(self, url):
+def is_valid_image_url(url):
     """Проверяет валидность URL изображения"""
     if not url.startswith(('http://', 'https://', '//')):
         return False
@@ -467,7 +467,7 @@ def _is_valid_image_url(self, url):
     
     return True
 
-def _rate_image_quality(self, image_url, element):
+def rate_image_quality(image_url, element):
     """Оценивает качество изображения по различным параметрам"""
     score = 0
     
