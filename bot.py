@@ -238,6 +238,7 @@ def improve_russian_grammar(text):
         text = text.replace(wrong, correct)
     
     return text
+    
 def extract_rich_content(text, max_length=600):
     """Извлекает богатый контент с деталями"""
     if not text:
