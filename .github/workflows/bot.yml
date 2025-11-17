@@ -1,13 +1,14 @@
-name: Fashion News Bot
+name: AI Fashion News Bot
 
 on:
   schedule:
-    - cron: '0 */1 * * *'  # Каждый час
+    - cron: '0 */2 * * *'  # Каждые 2 часа (увеличили интервал из-за AI-перевода)
   workflow_dispatch:  # Ручной запуск
 
 jobs:
   send-fashion-news:
     runs-on: ubuntu-latest
+    timeout-minutes: 30  # Увеличили таймаут для AI-обработки
     
     steps:
     - name: Checkout repository
@@ -23,7 +24,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         
-    - name: Run fashion bot
+    - name: Run AI Fashion Bot
       env:
         BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         CHANNEL: ${{ secrets.CHANNEL }}
@@ -31,8 +32,8 @@ jobs:
       
     - name: Notify success
       if: success()
-      run: echo "✅ Бот успешно выполнен"
+      run: echo "✅ AI Fashion Bot completed successfully"
       
     - name: Notify failure
       if: failure()
-      run: echo "❌ Бот завершился с ошибкой"
+      run: echo "❌ AI Fashion Bot failed"
