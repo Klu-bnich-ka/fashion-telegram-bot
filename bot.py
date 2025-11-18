@@ -6,109 +6,286 @@ from bs4 import BeautifulSoup
 import feedparser
 from datetime import datetime, timedelta
 import time
-import json
 import logging
 import hashlib
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin
 import sqlite3
-from contextlib import contextmanager
-import urllib3
-from textblob import TextBlob
-import sys
-
-# Отключаем предупреждения SSL
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from googletrans import Translator
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot_debug.log')
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Настройки
-BOT_TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-CHANNEL = os.environ.get('CHANNEL', '@YOUR_CHANNEL_HERE')
+BOT_TOKEN = os.environ['BOT_TOKEN']
+CHANNEL = os.environ['CHANNEL']
 
-# Проверяем переменные окружения
-if BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE' or CHANNEL == '@YOUR_CHANNEL_HERE':
-    logger.error("❌ Please set BOT_TOKEN and CHANNEL environment variables")
-    sys.exit(1)
-
-logger.info(f"✅ Bot token: {BOT_TOKEN[:10]}...")
-logger.info(f"✅ Channel: {CHANNEL}")
-
-# Только 3 самых популярных источника
+# 3 основных источника
 SOURCES = [
     {
         'name': 'Hypebeast', 
         'url': 'https://hypebeast.com/fashion/feed',
-        'lang': 'en',
-        'weight': 10
+        'base_url': 'https://hypebeast.com'
     },
     {
         'name': 'Highsnobiety', 
         'url': 'https://www.highsnobiety.com/feed/',
-        'lang': 'en', 
-        'weight': 9
+        'base_url': 'https://www.highsnobiety.com'
     },
     {
         'name': 'Sneaker News',
         'url': 'https://sneakernews.com/feed/',
-        'lang': 'en',
-        'weight': 8
+        'base_url': 'https://sneakernews.com'
     }
 ]
 
+# Популярные бренды для фильтрации
 BRANDS = [
     'Nike', 'Jordan', 'Adidas', 'New Balance', 'Supreme', 'Palace', 
     'Bape', 'Stussy', 'Off-White', 'Balenciaga', 'Gucci', 'Dior',
-    'Louis Vuitton', 'Prada', 'Chanel', 'Versace', 'Yeezy'
+    'Louis Vuitton', 'Prada', 'Chanel', 'Versace', 'Yeezy', 'Travis Scott',
+    'Fragment', 'Converse', 'Vans', 'Timberland', 'Arc\'teryx', 'Salomon'
 ]
 
-class ToporStyleFormatter:
-    """Форматирование в стиле Топора"""
-    
-    @staticmethod
-    def create_post(brand, title, content):
-        """Создает пост в стиле Топора"""
-        emoji = "👟"  # Простой эмодзи
+class SimpleTranslator:
+    def __init__(self):
+        self.translator = Translator()
         
-        # Генерируем реалистичные числа
-        subscribers = f"{random.randint(500, 1200)}K"
-        comments = random.randint(200, 2500)
-        time_posted = f"{random.randint(10, 23)}:{random.randint(10, 59)}"
-        
-        # Создаем пост в точном формате Топора
-        post = f"""{title}
+    def translate_text(self, text):
+        """Простой перевод текста"""
+        try:
+            if len(text) > 5000:
+                text = text[:5000]
+            translated = self.translator.translate(text, dest='ru')
+            return translated.text
+        except Exception as e:
+            logger.warning(f"Translation failed: {e}")
+            return text
 
-{content}
-
-Топор +18. Подписаться
-{subscribers} {time_posted}
-
-{comments} комментариев
-
-Топор+
-"""
-        return post
-
-class SimpleNewsAggregator:
-    """Упрощенный агрегатор новостей"""
-    
+class ContentExtractor:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/rss+xml, application/xml, text/xml, */*'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
+    
+    def extract_full_content(self, url):
+        """Извлекает полный контент и изображения со страницы"""
+        try:
+            response = self.session.get(url, timeout=10)
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Удаляем ненужные элементы
+            for element in soup.find_all(['script', 'style', 'nav', 'footer', 'aside']):
+                element.decompose()
+            
+            # Ищем основной контент
+            content_selectors = [
+                'article',
+                '.post-content',
+                '.entry-content',
+                '.article-content',
+                '.content',
+                'main'
+            ]
+            
+            content_element = None
+            for selector in content_selectors:
+                content_element = soup.select_one(selector)
+                if content_element:
+                    break
+            
+            if not content_element:
+                content_element = soup.find('body')
+            
+            # Извлекаем текст
+            text_content = self.clean_text(content_element.get_text())
+            
+            # Извлекаем все изображения
+            images = self.extract_images(soup, url)
+            
+            return text_content, images
+            
+        except Exception as e:
+            logger.error(f"Error extracting content from {url}: {e}")
+            return None, []
+    
+    def clean_text(self, text):
+        """Очищает текст"""
+        # Удаляем лишние пробелы и переносы
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\n+', '\n', text)
+        return text.strip()
+    
+    def extract_images(self, soup, base_url):
+        """Извлекает все изображения со страницы"""
+        images = []
+        img_selectors = [
+            'img',
+            '.wp-post-image',
+            '.article-image img',
+            '.post-image img',
+            '.entry-content img',
+            '.content img',
+            'figure img'
+        ]
         
-    def get_all_news(self):
-        """Получает все новости из источников"""
+        for selector in img_selectors:
+            for img in soup.select(selector):
+                src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
+                if src:
+                    if src.startswith('//'):
+                        src = 'https:' + src
+                    elif src.startswith('/'):
+                        src = urljoin(base_url, src)
+                    
+                    # Проверяем, что это нормальное изображение
+                    if self.is_valid_image(src):
+                        images.append(src)
+        
+        # Убираем дубликаты
+        return list(dict.fromkeys(images))
+    
+    def is_valid_image(self, url):
+        """Проверяет валидность изображения"""
+        excluded = ['logo', 'icon', 'avatar', 'thumbnail', 'pixel', 'spinner']
+        if any(term in url.lower() for term in excluded):
+            return False
+        
+        valid_ext = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
+        if not any(ext in url.lower() for ext in valid_ext):
+            return False
+            
+        return True
+
+class DatabaseManager:
+    def __init__(self):
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализирует базу данных"""
+        conn = sqlite3.connect('news.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sent_news (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_hash TEXT UNIQUE,
+                source TEXT,
+                title TEXT,
+                sent_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def is_news_sent(self, url):
+        """Проверяет, была ли новость отправлена"""
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        conn = sqlite3.connect('news.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM sent_news WHERE url_hash = ?', (url_hash,))
+        result = cursor.fetchone() is not None
+        conn.close()
+        return result
+    
+    def mark_news_sent(self, url, source, title):
+        """Помечает новость как отправленную"""
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        conn = sqlite3.connect('news.db')
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                'INSERT INTO sent_news (url_hash, source, title) VALUES (?, ?, ?)',
+                (url_hash, source, title[:200])
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            pass
+        conn.close()
+
+class TelegramPublisher:
+    def __init__(self, token, channel):
+        self.token = token
+        self.channel = channel
+        self.session = requests.Session()
+    
+    def send_photo_group(self, caption, photo_urls):
+        """Отправляет группу фотографий с подписью"""
+        if not photo_urls:
+            return self.send_message(caption)
+        
+        # Отправляем первую фотографию с подписью
+        first_photo = photo_urls[0]
+        additional_photos = photo_urls[1:4]  # Максимум 5 фото в группе
+        
+        try:
+            # Скачиваем первую фотографию
+            response = self.session.get(first_photo, timeout=10)
+            if response.status_code != 200:
+                return self.send_message(caption)
+            
+            files = {'photo': ('image.jpg', response.content, 'image/jpeg')}
+            data = {
+                'chat_id': self.channel,
+                'caption': caption,
+                'parse_mode': 'HTML'
+            }
+            
+            # Отправляем первую фото с подписью
+            url = f'https://api.telegram.org/bot{self.token}/sendPhoto'
+            response = self.session.post(url, files=files, data=data, timeout=30)
+            
+            if response.status_code == 200 and additional_photos:
+                # Получаем ID первого сообщения для группировки
+                first_message_id = response.json()['result']['message_id']
+                
+                # Отправляем остальные фото как группа
+                for photo_url in additional_photos:
+                    try:
+                        photo_response = self.session.get(photo_url, timeout=10)
+                        if photo_response.status_code == 200:
+                            files = {'photo': ('image.jpg', photo_response.content, 'image/jpeg')}
+                            data = {
+                                'chat_id': self.channel,
+                                'reply_to_message_id': first_message_id
+                            }
+                            self.session.post(url, files=files, data=data, timeout=30)
+                            time.sleep(1)  # Задержка между отправками
+                    except:
+                        continue
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error sending photos: {e}")
+            return self.send_message(caption)
+    
+    def send_message(self, text):
+        """Отправляет текстовое сообщение"""
+        url = f'https://api.telegram.org/bot{self.token}/sendMessage'
+        data = {
+            'chat_id': self.channel,
+            'text': text,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': False
+        }
+        
+        try:
+            response = self.session.post(url, json=data, timeout=30)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            return False
+
+class FashionNewsBot:
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.translator = SimpleTranslator()
+        self.extractor = ContentExtractor()
+        self.publisher = TelegramPublisher(BOT_TOKEN, CHANNEL)
+    
+    def check_sources(self):
+        """Проверяет все источники на новые новости"""
         all_news = []
         
         for source in SOURCES:
@@ -116,385 +293,149 @@ class SimpleNewsAggregator:
                 logger.info(f"🔍 Checking {source['name']}...")
                 news_items = self.parse_feed(source)
                 all_news.extend(news_items)
-                logger.info(f"✅ Found {len(news_items)} news from {source['name']}")
-                time.sleep(1)
+                time.sleep(2)  # Задержка между запросами
             except Exception as e:
-                logger.error(f"❌ Error with {source['name']}: {str(e)}")
+                logger.error(f"Error parsing {source['name']}: {e}")
                 continue
-                
+        
         return all_news
     
     def parse_feed(self, source):
-        """Парсит RSS фид"""
+        """Парсит RSS фид источника"""
         news_items = []
         
         try:
             feed = feedparser.parse(source['url'])
-            logger.info(f"📋 Feed {source['name']} has {len(feed.entries)} entries")
             
-            for entry in feed.entries[:5]:  # Берем только 5 последних
-                if self.is_recent(entry):
-                    news_item = self.process_entry(entry, source)
-                    if news_item:
-                        news_items.append(news_item)
-                        
+            for entry in feed.entries[:10]:  # Берем 10 последних записей
+                if self.is_recent(entry) and self.is_fashion_related(entry):
+                    news_item = {
+                        'title': entry.title,
+                        'url': entry.link,
+                        'source': source['name'],
+                        'published': getattr(entry, 'published', ''),
+                        'summary': getattr(entry, 'summary', '')[:500]  # Берем краткое описание
+                    }
+                    news_items.append(news_item)
+                    
         except Exception as e:
-            logger.error(f"❌ Feed parsing error {source['name']}: {str(e)}")
-            
+            logger.error(f"Error parsing feed {source['name']}: {e}")
+        
         return news_items
     
     def is_recent(self, entry, max_hours=24):
-        """Проверяет свежесть новости"""
+        """Проверяет, свежая ли новость"""
         try:
-            # Пробуем разные поля даты
-            date_str = getattr(entry, 'published', None) or getattr(entry, 'updated', None)
+            date_str = getattr(entry, 'published', '')
             if not date_str:
-                return True  # Если даты нет, считаем свежей
-                
-            # Парсим дату
-            parsed_date = self.parse_date(date_str)
-            if not parsed_date:
                 return True
                 
-            # Проверяем свежесть
-            time_diff = datetime.now() - parsed_date
-            return time_diff.total_seconds() / 3600 <= max_hours
+            # Простая проверка свежести
+            formats = [
+                '%a, %d %b %Y %H:%M:%S %Z',
+                '%a, %d %b %Y %H:%M:%S %z',
+                '%Y-%m-%dT%H:%M:%SZ'
+            ]
             
-        except Exception as e:
-            logger.warning(f"⚠️ Date parsing error: {e}")
+            for fmt in formats:
+                try:
+                    news_date = datetime.strptime(date_str, fmt)
+                    time_diff = datetime.now() - news_date
+                    return time_diff.total_seconds() / 3600 <= max_hours
+                except:
+                    continue
+                    
+            return True
+        except:
             return True
     
-    def parse_date(self, date_string):
-        """Парсит дату"""
-        formats = [
-            '%a, %d %b %Y %H:%M:%S %Z',
-            '%a, %d %b %Y %H:%M:%S %z', 
-            '%Y-%m-%dT%H:%M:%SZ',
-            '%Y-%m-%d %H:%M:%S'
+    def is_fashion_related(self, entry):
+        """Проверяет, относится ли новость к моде"""
+        content = f"{entry.title} {getattr(entry, 'summary', '')}".lower()
+        
+        # Ключевые слова для фильтрации
+        fashion_keywords = [
+            'sneaker', 'collection', 'collaboration', 'release', 'drop',
+            'fashion', 'streetwear', 'luxury', 'designer', 'boot',
+            'jacket', 'hoodie', 'shoe', 'apparel', 'capsule'
         ]
         
-        for fmt in formats:
-            try:
-                return datetime.strptime(date_string, fmt)
-            except:
-                continue
-        return None
+        brand_keywords = [brand.lower() for brand in BRANDS]
+        
+        return any(keyword in content for keyword in fashion_keywords + brand_keywords)
     
-    def process_entry(self, entry, source):
-        """Обрабатывает запись"""
-        try:
-            title = getattr(entry, 'title', 'No title')
-            description = getattr(entry, 'description', '')
-            link = getattr(entry, 'link', '')
-            
-            # Ищем бренд
-            brand = self.find_brand(title + " " + description)
-            if not brand:
-                return None
-            
-            # Очищаем контент
-            content = self.clean_content(description or title)
-            
-            return {
-                'title': title,
-                'content': content,
-                'brand': brand,
-                'source': source['name'],
-                'link': link,
-                'original_title': title
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Entry processing error: {e}")
+    def process_news(self, news_item):
+        """Обрабатывает новость и создает пост"""
+        # Проверяем, не отправляли ли уже
+        if self.db.is_news_sent(news_item['url']):
             return None
-    
-    def find_brand(self, text):
-        """Находит бренд в тексте"""
-        text_lower = text.lower()
-        for brand in BRANDS:
-            if brand.lower() in text_lower:
-                return brand
-        return None
-    
-    def clean_content(self, content):
-        """Очищает контент"""
-        # Удаляем HTML теги
-        clean = re.sub('<[^<]+?>', '', content)
-        # Удаляем лишние пробелы
-        clean = re.sub('\s+', ' ', clean).strip()
-        # Обрезаем до 200 символов
-        if len(clean) > 200:
-            clean = clean[:197] + '...'
-        return clean
-
-class SimpleContentEnhancer:
-    """Упрощенный усилитель контента"""
-    
-    def enhance_content(self, original_content, brand):
-        """Улучшает контент"""
-        # Простой перевод ключевых слов
-        translations = {
-            'release': 'релиз',
-            'collection': 'коллекция', 
-            'collaboration': 'коллаборация',
-            'sneakers': 'кроссовки',
-            'limited': 'лимитированный',
-            'edition': 'издание',
-            'new': 'новый',
-            'available': 'доступен'
-        }
         
-        content = original_content
-        for eng, rus in translations.items():
-            content = re.sub(rf'\b{eng}\b', rus, content, flags=re.IGNORECASE)
+        logger.info(f"📝 Processing: {news_item['title']}")
         
-        # Делаем более разговорным
-        content = content.replace('The', '').replace('A ', '')
+        # Извлекаем полный контент
+        full_content, images = self.extractor.extract_full_content(news_item['url'])
         
-        return content
-    
-    def create_catchy_title(self, original_title, brand):
-        """Создает цепляющий заголовок"""
-        templates = [
-            f"{brand} запускает новый дроп",
-            f"Новинка от {brand} уже здесь", 
-            f"{brand} удивляет новым релизом",
-            f"Хит сезона от {brand}",
-            f"{brand} анонсирует коллаборацию"
-        ]
-        return random.choice(templates)
-
-class DatabaseManager:
-    """Менеджер базы данных"""
-    
-    def __init__(self):
-        self.init_db()
-    
-    def init_db(self):
-        """Инициализирует БД"""
-        conn = sqlite3.connect('news.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sent_posts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                content_hash TEXT UNIQUE,
-                brand TEXT,
-                sent_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
-        conn.close()
-    
-    def is_duplicate(self, content):
-        """Проверяет дубликат"""
-        content_hash = hashlib.md5(content.encode()).hexdigest()
-        conn = sqlite3.connect('news.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT 1 FROM sent_posts WHERE content_hash = ?', (content_hash,))
-        result = cursor.fetchone() is not None
-        conn.close()
-        return result
-    
-    def mark_sent(self, content, brand):
-        """Помечает как отправленное"""
-        content_hash = hashlib.md5(content.encode()).hexdigest()
-        conn = sqlite3.connect('news.db')
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                'INSERT INTO sent_posts (content_hash, brand) VALUES (?, ?)',
-                (content_hash, brand)
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            pass
-        conn.close()
-
-class TelegramBot:
-    """Упрощенный Telegram бот"""
-    
-    def __init__(self, token, channel):
-        self.token = token
-        self.channel = channel
-        self.session = requests.Session()
-        self.timeout = 30
-    
-    def send_message(self, text):
-        """Отправляет сообщение"""
-        url = f'https://api.telegram.org/bot{self.token}/sendMessage'
+        if not full_content:
+            full_content = news_item['summary']
         
-        payload = {
-            'chat_id': self.channel,
-            'text': text,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': True
-        }
+        # Переводим
+        translated_title = self.translator.translate_text(news_item['title'])
+        translated_content = self.translator.translate_text(full_content)
         
-        try:
-            logger.info(f"📤 Sending message to Telegram...")
-            logger.info(f"Message preview: {text[:100]}...")
-            
-            response = self.session.post(url, json=payload, timeout=self.timeout)
-            response_data = response.json()
-            
-            logger.info(f"📡 Telegram API response: {response.status_code}")
-            
-            if response.status_code == 200:
-                logger.info("✅ Message sent successfully!")
-                return True
-            else:
-                logger.error(f"❌ Telegram API error: {response_data}")
-                return False
-                
-        except requests.exceptions.Timeout:
-            logger.error("❌ Request timeout")
-            return False
-        except requests.exceptions.ConnectionError:
-            logger.error("❌ Connection error")
-            return False
-        except Exception as e:
-            logger.error(f"❌ Unexpected error: {str(e)}")
-            return False
-    
-    def test_connection(self):
-        """Тестирует соединение с ботом"""
-        url = f'https://api.telegram.org/bot{self.token}/getMe'
+        # Обрезаем контент до 100+ слов
+        words = translated_content.split()
+        if len(words) > 100:
+            translated_content = ' '.join(words[:400]) + '...'  # ~100+ слов
         
-        try:
-            response = self.session.get(url, timeout=10)
-            if response.status_code == 200:
-                bot_info = response.json()
-                logger.info(f"✅ Bot connection test passed: {bot_info['result']['username']}")
-                return True
-            else:
-                logger.error(f"❌ Bot connection test failed: {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ Bot connection test error: {e}")
-            return False
-
-class FashionNewsBot:
-    """Главный класс бота"""
+        # Создаем пост
+        post = self.create_post(translated_title, translated_content, news_item, images)
+        
+        # Помечаем как отправленную
+        self.db.mark_news_sent(news_item['url'], news_item['source'], news_item['title'])
+        
+        return post, images
     
-    def __init__(self):
-        self.db = DatabaseManager()
-        self.aggregator = SimpleNewsAggregator()
-        self.enhancer = SimpleContentEnhancer()
-        self.formatter = ToporStyleFormatter()
-        self.bot = TelegramBot(BOT_TOKEN, CHANNEL)
+    def create_post(self, title, content, news_item, images):
+        """Создает пост для Telegram"""
+        # Простой и чистый формат
+        post = f"<b>{title}</b>\n\n"
+        post += f"{content}\n\n"
+        post += f"📰 Источник: {news_item['source']}\n"
+        post += f"🔗 <a href='{news_item['url']}'>Читать полностью</a>"
+        
+        return post
     
     def run(self):
         """Запускает бота"""
         logger.info("🚀 Starting Fashion News Bot")
         
-        # Тестируем соединение с ботом
-        if not self.bot.test_connection():
-            logger.error("❌ Bot connection test failed. Exiting.")
-            return False
+        # Проверяем источники
+        all_news = self.check_sources()
+        logger.info(f"📰 Found {len(all_news)} new news items")
         
-        # Ищем новости
-        all_news = self.aggregator.get_all_news()
-        logger.info(f"📰 Total news found: {len(all_news)}")
-        
-        if not all_news:
-            logger.warning("⚠️ No news found, generating fallback content...")
-            return self.send_fallback_content()
-        
-        # Пробуем отправить первую подходящую новость
-        for news in all_news:
-            if self.try_send_news(news):
-                return True
-        
-        # Если ничего не нашли, отправляем фолбэк
-        logger.warning("⚠️ No suitable news found, sending fallback...")
-        return self.send_fallback_content()
-    
-    def try_send_news(self, news):
-        """Пробует отправить новость"""
-        try:
-            brand = news['brand']
-            original_content = news['content']
-            original_title = news['title']
-            
-            # Улучшаем контент
-            enhanced_content = self.enhancer.enhance_content(original_content, brand)
-            catchy_title = self.enhancer.create_catchy_title(original_title, brand)
-            
-            # Создаем финальный пост
-            final_content = f"{catchy_title}\n\n{enhanced_content}"
-            
-            # Проверяем дубликат
-            if self.db.is_duplicate(final_content):
-                logger.info(f"⏭️ Duplicate content skipped: {brand}")
-                return False
-            
-            # Создаем пост в стиле Топора
-            post = self.formatter.create_post(brand, catchy_title, enhanced_content)
-            
-            # Отправляем
-            if self.bot.send_message(post):
-                self.db.mark_sent(final_content, brand)
-                logger.info(f"✅ Successfully posted about {brand}")
-                return True
-            else:
-                logger.error(f"❌ Failed to post about {brand}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Error processing news: {e}")
-            return False
-    
-    def send_fallback_content(self):
-        """Отправляет фолбэк контент"""
-        fallback_brands = [
-            {
-                'brand': 'Nike',
-                'title': 'Nike готовит сюрприз',
-                'content': 'По слухам, Nike работает над новой коллаборацией с известным дизайнером. Ожидается ограниченный релиз.'
-            },
-            {
-                'brand': 'Adidas', 
-                'content': 'Adidas анонсирует обновление культовой модели. Фанаты ждут с нетерпением.'
-            },
-            {
-                'brand': 'Supreme',
-                'content': 'Supreme готовит новый дроп с неожиданным партнером. Инсайдеры говорят о сюрпризе.'
-            }
-        ]
-        
-        fallback = random.choice(fallback_brands)
-        catchy_title = self.enhancer.create_catchy_title(fallback['title'], fallback['brand'])
-        post = self.formatter.create_post(fallback['brand'], catchy_title, fallback['content'])
-        
-        logger.info("🔄 Sending fallback content...")
-        return self.bot.send_message(post)
-
-def main():
-    """Главная функция"""
-    max_retries = 3
-    retry_delay = 5
-    
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"🔄 Attempt {attempt + 1}/{max_retries}")
-            
-            bot = FashionNewsBot()
-            success = bot.run()
-            
-            if success:
-                logger.info("🎉 Bot finished successfully!")
-                return
-            else:
-                logger.warning(f"⚠️ Attempt {attempt + 1} failed")
-                
-        except Exception as e:
-            logger.error(f"💥 Critical error in attempt {attempt + 1}: {e}")
-        
-        if attempt < max_retries - 1:
-            logger.info(f"⏳ Waiting {retry_delay} seconds before retry...")
-            time.sleep(retry_delay)
-    
-    logger.error("💥 All attempts failed!")
+        # Обрабатываем и публикуем каждую новость
+        for news_item in all_news:
+            try:
+                result = self.process_news(news_item)
+                if result:
+                    post, images = result
+                    
+                    # Публикуем пост
+                    success = self.publisher.send_photo_group(post, images)
+                    
+                    if success:
+                        logger.info(f"✅ Published: {news_item['title'][:50]}...")
+                    else:
+                        logger.error(f"❌ Failed to publish: {news_item['title'][:50]}...")
+                    
+                    # Задержка между постами
+                    time.sleep(10)
+                    
+            except Exception as e:
+                logger.error(f"❌ Error processing news: {e}")
+                continue
 
 if __name__ == "__main__":
-    main()
+    bot = FashionNewsBot()
+    bot.run()
+    logger.info("✅ Bot finished!")
