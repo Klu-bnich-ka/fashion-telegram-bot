@@ -1,12 +1,12 @@
-name: Fashion News Bot (Topor Style)
+name: Fashion News Bot
 
 on:
   schedule:
     - cron: '*/30 * * * *'  # Каждые 30 минут
-  workflow_dispatch:  # Ручной запуск
+  workflow_dispatch:
 
 jobs:
-  send-fashion-news:
+  send-news:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     
@@ -24,16 +24,8 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         
-    - name: Run Fashion News Bot
+    - name: Run News Bot
       env:
         BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         CHANNEL: ${{ secrets.CHANNEL }}
       run: python bot.py
-      
-    - name: Notify success
-      if: success()
-      run: echo "✅ Fashion news bot completed successfully"
-      
-    - name: Notify failure
-      if: failure()
-      run: echo "❌ Fashion news bot failed"
