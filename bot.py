@@ -11,21 +11,6 @@ import hashlib
 from urllib.parse import urljoin
 import sqlite3
 from googletrans import Translator
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import sent_tokenize, word_tokenize
-import string
-
-# Скачиваем необходимые данные для nltk
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
-
-try:
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('stopwords')
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,42 +42,46 @@ SOURCES = [
 class ContentProcessor:
     def __init__(self):
         self.translator = Translator()
-        self.stop_words = set(stopwords.words('english'))
         
     def extract_key_points(self, text, max_sentences=3):
-        """Извлекает ключевые моменты из текста"""
-        # Разбиваем на предложения
-        sentences = sent_tokenize(text)
+        """Извлекает ключевые моменты из текста простым способом"""
+        # Разбиваем на предложения по точкам
+        sentences = [s.strip() for s in text.split('.') if s.strip()]
         
-        # Оцениваем важность каждого предложения
+        if len(sentences) <= max_sentences:
+            return '. '.join(sentences) + '.'
+        
+        # Оцениваем важность каждого предложения простым способом
         scored_sentences = []
         for i, sentence in enumerate(sentences):
-            score = self.score_sentence(sentence, i, len(sentences))
+            score = self.simple_sentence_score(sentence, i, len(sentences))
             scored_sentences.append((sentence, score))
         
         # Сортируем по важности
         scored_sentences.sort(key=lambda x: x[1], reverse=True)
         
-        # Берем топ предложения
+        # Берем топ предложения и возвращаем в оригинальном порядке
         top_sentences = [s[0] for s in scored_sentences[:max_sentences]]
         
-        # Сортируем по порядку в тексте
+        # Сохраняем порядок из оригинального текста
         final_sentences = []
-        for original_sentence in sentences:
-            if original_sentence in top_sentences:
-                final_sentences.append(original_sentence)
+        for sentence in sentences:
+            if sentence in top_sentences:
+                final_sentences.append(sentence)
+                if len(final_sentences) >= max_sentences:
+                    break
         
-        return ' '.join(final_sentences)
+        return '. '.join(final_sentences) + '.'
     
-    def score_sentence(self, sentence, position, total_sentences):
-        """Оценивает важность предложения"""
+    def simple_sentence_score(self, sentence, position, total_sentences):
+        """Простая оценка важности предложения"""
         score = 0
         
-        # Предложения в начале обычно важнее
+        # Предложения в начале важнее
         score += (1 - position / total_sentences) * 2
         
-        # Длина предложения (средняя длина лучше)
-        words = word_tokenize(sentence)
+        # Проверяем длину (средняя длина лучше)
+        words = sentence.split()
         if 8 <= len(words) <= 25:
             score += 2
         
@@ -134,22 +123,7 @@ class ContentProcessor:
         # Удаляем ссылки
         text = re.sub(r'http\S+', '', text)
         
-        # Улучшаем начало предложений
-        text = self.improve_sentence_structure(text)
-        
         return text.strip()
-    
-    def improve_sentence_structure(self, text):
-        """Улучшает структуру предложений"""
-        # Делаем первое предложение более impactful
-        sentences = sent_tokenize(text)
-        if sentences:
-            first_sentence = sentences[0]
-            # Убираем вводные конструкции
-            first_sentence = re.sub(r'^(according to|reports indicate that|it has been announced that)\s+', '', first_sentence, flags=re.IGNORECASE)
-            sentences[0] = first_sentence.capitalize()
-        
-        return ' '.join(sentences)
     
     def smart_translate(self, text):
         """Умный перевод с улучшением качества"""
@@ -367,21 +341,12 @@ class PostCreator:
     
     def improve_content(self, content):
         """Улучшает содержание"""
-        # Разбиваем на предложения
-        sentences = sent_tokenize(content)
-        
-        if not sentences:
-            return content
-        
         # Выделяем ключевые моменты жирным
-        improved_sentences = []
-        for sentence in sentences:
-            improved_sentence = self.highlight_key_points(sentence)
-            improved_sentences.append(improved_sentence)
+        improved_content = self.highlight_key_points(content)
         
-        return ' '.join(improved_sentences)
+        return improved_content
     
-    def highlight_key_points(self, sentence):
+    def highlight_key_points(self, text):
         """Выделяет ключевые моменты жирным"""
         # Ключевые фразы для выделения
         key_phrases = [
@@ -396,7 +361,7 @@ class PostCreator:
             r'капсульная коллекция'
         ]
         
-        result = sentence
+        result = text
         for phrase in key_phrases:
             matches = re.finditer(phrase, result, re.IGNORECASE)
             for match in matches:
