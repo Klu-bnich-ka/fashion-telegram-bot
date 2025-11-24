@@ -1,640 +1,460 @@
-import requests
+#!/usr/bin/env python3
+# coding: utf-8
+"""
+Fashion News Bot — версия для GitHub Actions (HTML-aware + RSS + repo-state commit).
+Запускается по cron (например, каждые 30 минут).
+Secrets: BOT_TOKEN, CHANNEL (или CHAT_ID). Опционально: DEEPL_KEY.
+"""
+
 import os
-import re
-import random
+import json
+import time
+import hashlib
+import logging
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
+
+import requests
 from bs4 import BeautifulSoup
 import feedparser
-from datetime import datetime, timedelta
-import time
-import logging
-import hashlib
-from urllib.parse import urljoin
-import sqlite3
-from googletrans import Translator
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# --------- Настройка логирования ---------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("fashion-bot")
 
-# Настройки
-BOT_TOKEN = os.environ['BOT_TOKEN']
-CHANNEL = os.environ['CHANNEL']
+# --------- Конфигурация ---------
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # required
+CHANNEL = os.getenv("CHANNEL")      # required (chat_id or @channelusername)
+DEEPL_KEY = os.getenv("DEEPL_KEY")  # optional
 
-# 3 основных источника
+# Максимум новостей за запуск
+MAX_SEND = 3
+
+# Источники: RSS + листинговые страницы (парсер умеет работать и по RSS и по HTML)
 SOURCES = [
     {
-        'name': 'Hypebeast', 
-        'url': 'https://hypebeast.com/fashion/feed',
-        'base_url': 'https://hypebeast.com'
+        "name": "Hypebeast",
+        "rss": "https://hypebeast.com/fashion/feed",
+        "list_url": "https://hypebeast.com/fashion",
+        "base_url": "https://hypebeast.com",
     },
     {
-        'name': 'Highsnobiety', 
-        'url': 'https://www.highsnobiety.com/feed/',
-        'base_url': 'https://www.highsnobiety.com'
+        "name": "Highsnobiety",
+        "rss": "https://www.highsnobiety.com/feed/",
+        "list_url": "https://www.highsnobiety.com/page/1/",
+        "base_url": "https://www.highsnobiety.com",
     },
     {
-        'name': 'Sneaker News',
-        'url': 'https://sneakernews.com/feed/',
-        'base_url': 'https://sneakernews.com'
-    }
+        "name": "SneakerNews",
+        "rss": "https://sneakernews.com/feed/",
+        "list_url": "https://sneakernews.com/",
+        "base_url": "https://sneakernews.com",
+    },
+    # Можно легко добавить дополнительные источники здесь
 ]
 
-class ContentProcessor:
-    def __init__(self):
-        self.translator = Translator()
-        
-    def extract_key_points(self, text, max_sentences=3):
-        """Извлекает ключевые моменты из текста простым способом"""
-        # Разбиваем на предложения по точкам
-        sentences = [s.strip() for s in text.split('.') if s.strip()]
-        
-        if len(sentences) <= max_sentences:
-            return '. '.join(sentences) + '.'
-        
-        # Оцениваем важность каждого предложения простым способом
-        scored_sentences = []
-        for i, sentence in enumerate(sentences):
-            score = self.simple_sentence_score(sentence, i, len(sentences))
-            scored_sentences.append((sentence, score))
-        
-        # Сортируем по важности
-        scored_sentences.sort(key=lambda x: x[1], reverse=True)
-        
-        # Берем топ предложения и возвращаем в оригинальном порядке
-        top_sentences = [s[0] for s in scored_sentences[:max_sentences]]
-        
-        # Сохраняем порядок из оригинального текста
-        final_sentences = []
-        for sentence in sentences:
-            if sentence in top_sentences:
-                final_sentences.append(sentence)
-                if len(final_sentences) >= max_sentences:
-                    break
-        
-        return '. '.join(final_sentences) + '.'
-    
-    def simple_sentence_score(self, sentence, position, total_sentences):
-        """Простая оценка важности предложения"""
-        score = 0
-        
-        # Предложения в начале важнее
-        score += (1 - position / total_sentences) * 2
-        
-        # Проверяем длину (средняя длина лучше)
-        words = sentence.split()
-        if 8 <= len(words) <= 25:
-            score += 2
-        
-        # Ключевые слова
-        important_keywords = [
-            'collaboration', 'release', 'limited', 'exclusive', 'new',
-            'collection', 'drop', 'launch', 'announce', 'available',
-            'first', 'special', 'edition', 'capsule', 'sneaker'
-        ]
-        
-        for keyword in important_keywords:
-            if keyword in sentence.lower():
-                score += 3
-        
-        # Бренды в предложении
-        brands_in_sentence = any(brand.lower() in sentence.lower() for brand in [
-            'Nike', 'Jordan', 'Adidas', 'Supreme', 'Bape', 'Gucci'
-        ])
-        if brands_in_sentence:
-            score += 2
-        
-        return score
-    
-    def clean_and_improve_text(self, text):
-        """Очищает и улучшает текст"""
-        # Удаляем лишние пробелы и переносы
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'\n+', ' ', text)
-        
-        # Удаляем технические фразы
-        technical_phrases = [
-            'read more', 'read full article', 'click here', 'continue reading',
-            'source:', 'image credit:', 'photo via', 'courtesy of'
-        ]
-        
-        for phrase in technical_phrases:
-            text = re.sub(phrase, '', text, flags=re.IGNORECASE)
-        
-        # Удаляем ссылки
-        text = re.sub(r'http\S+', '', text)
-        
-        return text.strip()
-    
-    def smart_translate(self, text):
-        """Умный перевод с улучшением качества"""
-        try:
-            if len(text) > 4000:
-                text = text[:4000]
-            
-            translated = self.translator.translate(text, dest='ru')
-            
-            # Улучшаем русский текст
-            improved_russian = self.improve_russian_text(translated.text)
-            return improved_russian
-            
-        except Exception as e:
-            logger.warning(f"Translation failed: {e}")
-            return text
-    
-    def improve_russian_text(self, text):
-        """Улучшает качество русского текста"""
-        # Исправляем частые ошибки перевода
-        improvements = {
-            'релиз': 'релиз',
-            'коллаборация': 'коллаборация',
-            'коллекция': 'коллекция',
-            'кроссовки': 'кроссовки',
-            'лимитированный': 'лимитированный',
-            'эксклюзивный': 'эксклюзивный',
-            'доступен': 'доступен',
-            'анонсировал': 'анонсировал',
-            'запустил': 'запустил'
-        }
-        
-        for eng, ru in improvements.items():
-            text = text.replace(eng, ru)
-        
-        # Делаем текст более естественным
-        text = text.replace(' ,', ',')
-        text = text.replace(' .', '.')
-        text = re.sub(r'\s+', ' ', text)
-        
-        return text
+# Ключевые слова для ранжирования (стиль 1)
+PRIORITY_KEYWORDS = [
+    "collaboration", "release", "limited", "exclusive", "new", "collection", "drop",
+    "launch", "announce", "available", "first", "special", "edition", "capsule",
+    "sneaker", "runway", "fashion week", "fw", "ss", "show", "creative director",
+]
 
-class SmartContentExtractor:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        self.processor = ContentProcessor()
-    
-    def extract_quality_content(self, url):
-        """Извлекает качественный контент и изображения"""
-        try:
-            response = self.session.get(url, timeout=10)
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Удаляем ненужные элементы
-            for element in soup.find_all(['script', 'style', 'nav', 'footer', 'aside', 'form']):
-                element.decompose()
-            
-            # Ищем основной контент статьи
-            article_content = self.find_article_content(soup)
-            
-            if not article_content:
-                return None, []
-            
-            # Извлекаем чистый текст
-            raw_text = article_content.get_text()
-            clean_text = self.processor.clean_and_improve_text(raw_text)
-            
-            # Извлекаем ключевые моменты
-            key_points = self.processor.extract_key_points(clean_text)
-            
-            # Извлекаем качественные изображения
-            images = self.extract_quality_images(soup, url)
-            
-            return key_points, images
-            
-        except Exception as e:
-            logger.error(f"Error extracting content from {url}: {e}")
-            return None, []
-    
-    def find_article_content(self, soup):
-        """Находит основной контент статьи"""
-        content_selectors = [
-            'article .post-content',
-            'article .entry-content',
-            'article .article-content',
-            'article .content',
-            '.post-content',
-            '.entry-content',
-            '.article-content',
-            '.content',
-            'article'
+# Файл со списком отправленных хэшей (будет в репозитории и коммитится обратно)
+SENT_FILE = "sent.json"
+
+# HTTP сессия
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; FashionNewsBot/1.0; +https://github.com/)"
+})
+
+
+# --------- Утилиты ---------
+def load_sent():
+    try:
+        if os.path.exists(SENT_FILE):
+            with open(SENT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and "sent" in data:
+                    return set(data["sent"])
+        return set()
+    except Exception as e:
+        logger.warning("Failed load sent.json: %s", e)
+        return set()
+
+
+def save_sent(sent_set):
+    try:
+        data = {"sent": sorted(list(sent_set))}
+        with open(SENT_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error("Failed to write sent.json: %s", e)
+
+
+def hash_url(url):
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def short_text(text, limit=600):
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "..."
+
+
+# --------- Парсинг: RSS и HTML list pages ---------
+def fetch_rss_items(rss_url, source_name, max_items=10):
+    items = []
+    try:
+        feed = feedparser.parse(rss_url)
+        for entry in feed.entries[:max_items]:
+            title = getattr(entry, "title", "")
+            link = getattr(entry, "link", "")
+            summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
+            published = getattr(entry, "published", "") or getattr(entry, "updated", "")
+            if link:
+                items.append({
+                    "title": title,
+                    "url": link,
+                    "summary": summary,
+                    "source": source_name,
+                    "published": published
+                })
+    except Exception as e:
+        logger.debug("RSS fetch failed for %s: %s", rss_url, e)
+    return items
+
+
+def fetch_html_list(list_url, base_url, source_name, max_items=12):
+    """Делает лёгкий парсинг страницы-списка статей, берёт ссылки и заголовки.
+       Делаем общий алгоритм: берем все <a> с href, фильтруем на внутренние ссылки и возвращаем уникальные.
+    """
+    items = []
+    try:
+        r = SESSION.get(list_url, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, "html.parser")
+        anchors = soup.find_all("a", href=True)
+        seen = set()
+        for a in anchors:
+            href = a["href"]
+            # Нормализуем
+            if href.startswith("/"):
+                href = urljoin(base_url, href)
+            if not href.startswith("http"):
+                continue
+            # Ограничение: только внутри домена base_url
+            if urlparse(href).netloc not in (urlparse(base_url).netloc,):
+                continue
+            if href in seen:
+                continue
+            seen.add(href)
+            title = (a.get_text() or "").strip()
+            if not title:
+                # иногда заголовок в img alt
+                img = a.find("img", alt=True)
+                title = img["alt"].strip() if img else ""
+            if not title:
+                continue
+            items.append({
+                "title": title,
+                "url": href,
+                "summary": "",
+                "source": source_name,
+                "published": ""
+            })
+            if len(items) >= max_items:
+                break
+    except Exception as e:
+        logger.debug("HTML list fetch failed for %s: %s", list_url, e)
+    return items
+
+
+# --------- Извлечение содержания конкретной статьи (умеренный HTML-парсинг) ---------
+def extract_article_content(url, base_url):
+    try:
+        r = SESSION.get(url, timeout=12)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, "html.parser")
+
+        # Удаляем лишнее
+        for tag in soup(["script", "style", "nav", "footer", "aside", "form", "noscript"]):
+            tag.decompose()
+
+        # Попытки найти основной блок: несколько распространённых селекторов
+        selectors = [
+            "article",
+            ".post-content",
+            ".entry-content",
+            ".article-content",
+            ".post-body",
+            ".content"
         ]
-        
-        for selector in content_selectors:
-            element = soup.select_one(selector)
-            if element and len(element.get_text(strip=True)) > 200:
-                return element
-        
-        return soup.find('body')
-    
-    def extract_quality_images(self, soup, base_url):
-        """Извлекает только качественные изображения"""
+        main = None
+        for sel in selectors:
+            main = soup.select_one(sel)
+            if main and len(main.get_text(strip=True)) > 150:
+                break
+        if not main:
+            main = soup.find("body")
+
+        text = short_text(main.get_text(separator=" ", strip=True), limit=800)
+
+        # Картинки: ищем большие изображения в статье
         images = []
-        
-        # Приоритетные селекторы для главных изображений
-        priority_selectors = [
-            '.wp-post-image',
-            '.article-image img',
-            '.post-image img',
-            '.featured-image img',
-            '.hero-image img',
-            'figure img',
-            '.entry-content img:first-of-type',
-            '.content img:first-of-type'
+        # приоритетные селекторы
+        img_selectors = [
+            "figure img",
+            "img.featured",
+            ".featured-image img",
+            ".article-image img",
+            ".post-image img",
+            ".hero img",
+            "img"
         ]
-        
-        # Сначала ищем приоритетные изображения
-        for selector in priority_selectors:
-            imgs = soup.select(selector)
-            for img in imgs[:2]:  # Берем только первые 2
-                src = self.get_image_src(img)
-                if src and self.is_quality_image(src):
-                    full_url = self.make_absolute_url(src, base_url)
-                    if full_url:
-                        images.append(full_url)
-        
-        # Если нет приоритетных, ищем любые качественные
-        if not images:
-            all_imgs = soup.find_all('img')
-            for img in all_imgs[:3]:  # Ограничиваем количество
-                src = self.get_image_src(img)
-                if src and self.is_quality_image(src):
-                    full_url = self.make_absolute_url(src, base_url)
-                    if full_url:
-                        images.append(full_url)
-        
-        # Убираем дубликаты и ограничиваем количество
-        return list(dict.fromkeys(images))[:3]  # Максимум 3 изображения
-    
-    def get_image_src(self, img_element):
-        """Получает URL изображения из элемента"""
-        return (img_element.get('src') or 
-                img_element.get('data-src') or 
-                img_element.get('data-lazy-src'))
-    
-    def make_absolute_url(self, url, base_url):
-        """Преобразует относительный URL в абсолютный"""
-        if url.startswith('//'):
-            return 'https:' + url
-        elif url.startswith('/'):
-            return urljoin(base_url, url)
-        elif url.startswith(('http://', 'https://')):
-            return url
-        return None
-    
-    def is_quality_image(self, url):
-        """Проверяет, является ли изображение качественным"""
-        excluded_terms = [
-            'logo', 'icon', 'avatar', 'thumbnail', 'pixel', 'spinner',
-            'advertisement', 'banner', 'widget', 'placeholder'
-        ]
-        
-        if any(term in url.lower() for term in excluded_terms):
-            return False
-        
-        valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
-        if not any(ext in url.lower() for ext in valid_extensions):
-            return False
-        
-        # Проверяем размер в URL (признак качественного изображения)
-        size_indicators = ['large', 'xlarge', 'xxlarge', 'original', 'full', 'main']
-        if any(indicator in url.lower() for indicator in size_indicators):
-            return True
-        
-        return True
+        for sel in img_selectors:
+            for img in main.select(sel):
+                src = img.get("data-src") or img.get("src") or img.get("data-lazy-src")
+                if not src:
+                    continue
+                if src.startswith("//"):
+                    src = "https:" + src
+                if src.startswith("/"):
+                    src = urljoin(base_url, src)
+                if any(x in src.lower() for x in ("logo", "icon", "sprite", "thumb")):
+                    continue
+                if src not in images:
+                    images.append(src)
+                if len(images) >= 3:
+                    break
+            if images:
+                break
 
-class PostCreator:
-    def __init__(self):
-        self.processor = ContentProcessor()
-    
-    def create_clean_post(self, title, content, source, images_count=0):
-        """Создает чистый и привлекательный пост"""
-        # Улучшаем заголовок
-        improved_title = self.improve_title(title)
-        
-        # Улучшаем контент
-        improved_content = self.improve_content(content)
-        
-        # Создаем пост
-        post = f"<b>{improved_title}</b>\n\n"
-        post += f"{improved_content}\n\n"
-        
-        # Добавляем информацию об изображениях
-        if images_count > 0:
-            post += f"🖼️ В материале: {images_count} фото\n\n"
-        
-        post += f"📰 {source}"
-        
-        return post
-    
-    def improve_title(self, title):
-        """Улучшает заголовок"""
-        # Убираем технические элементы
-        title = re.sub(r'\s*-\s*[^-]*$', '', title)  # Убираем "- Source Name"
-        title = re.sub(r'\s*\|.*$', '', title)  # Убираем "| Section"
-        
-        # Делаем первую букву заглавной
-        if title:
-            title = title[0].upper() + title[1:]
-        
-        return title.strip()
-    
-    def improve_content(self, content):
-        """Улучшает содержание"""
-        # Выделяем ключевые моменты жирным
-        improved_content = self.highlight_key_points(content)
-        
-        return improved_content
-    
-    def highlight_key_points(self, text):
-        """Выделяет ключевые моменты жирным"""
-        # Ключевые фразы для выделения
-        key_phrases = [
-            r'коллаборация\w*',
-            r'лимитированн\w*',
-            r'эксклюзивн\w*',
-            r'релиз\w*',
-            r'новый модель',
-            r'впервые',
-            r'ограниченный тираж',
-            r'специальный выпуск',
-            r'капсульная коллекция'
-        ]
-        
-        result = text
-        for phrase in key_phrases:
-            matches = re.finditer(phrase, result, re.IGNORECASE)
-            for match in matches:
-                original = match.group()
-                highlighted = f"<b>{original}</b>"
-                result = result.replace(original, highlighted)
-        
-        return result
+        return text, images[:3]
+    except Exception as e:
+        logger.debug("Failed to extract article %s: %s", url, e)
+        return "", []
 
-class DatabaseManager:
-    def __init__(self):
-        self.init_database()
-    
-    def init_database(self):
-        """Инициализирует базу данных"""
-        conn = sqlite3.connect('news.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS sent_news (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url_hash TEXT UNIQUE,
-                source TEXT,
-                title TEXT,
-                sent_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.commit()
-        conn.close()
-    
-    def is_news_sent(self, url):
-        """Проверяет, была ли новость отправлена"""
-        url_hash = hashlib.md5(url.encode()).hexdigest()
-        conn = sqlite3.connect('news.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT 1 FROM sent_news WHERE url_hash = ?', (url_hash,))
-        result = cursor.fetchone() is not None
-        conn.close()
-        return result
-    
-    def mark_news_sent(self, url, source, title):
-        """Помечает новость как отправленную"""
-        url_hash = hashlib.md5(url.encode()).hexdigest()
-        conn = sqlite3.connect('news.db')
-        cursor = conn.cursor()
-        try:
-            cursor.execute(
-                'INSERT INTO sent_news (url_hash, source, title) VALUES (?, ?, ?)',
-                (url_hash, source, title[:200])
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            pass
-        conn.close()
 
+# --------- Ранжирование и фильтрация (стиль 1) ---------
+def score_item(item):
+    title = (item.get("title") or "").lower()
+    summary = (item.get("summary") or "").lower()
+    text = f"{title} {summary}"
+
+    score = 0
+    # Ключевые слова повышают оценку
+    for kw in PRIORITY_KEYWORDS:
+        if kw in text:
+            score += 5
+    # короткие заголовки часто важнее
+    if len(title.split()) <= 8:
+        score += 1
+    # слова "exclusive" / "limited" дают бонус
+    if "exclusive" in text or "limited" in text:
+        score += 3
+    # бренды (примерный набор)
+    for brand in ("nike", "adidas", "gucci", "supreme", "jordan", "balenciaga", "prada"):
+        if brand in text:
+            score += 2
+    return score
+
+
+# --------- Перевод (опционально через DeepL) ---------
+def deepl_translate(text, target_lang="RU"):
+    if not DEEPL_KEY:
+        return text
+    try:
+        resp = requests.post(
+            "https://api-free.deepl.com/v2/translate",
+            data={"auth_key": DEEPL_KEY, "text": text, "target_lang": target_lang}
+        )
+        resp.raise_for_status()
+        j = resp.json()
+        if "translations" in j and len(j["translations"]) > 0:
+            return j["translations"][0].get("text", text)
+    except Exception as e:
+        logger.warning("DeepL translation failed: %s", e)
+    return text
+
+
+# --------- Telegram publish ---------
 class TelegramPublisher:
     def __init__(self, token, channel):
         self.token = token
         self.channel = channel
-        self.session = requests.Session()
-    
-    def send_photo_group(self, caption, photo_urls):
-        """Отправляет группу фотографий с подписью"""
-        if not photo_urls:
-            return self.send_message(caption)
-        
-        # Отправляем первую фотографию с подписью
-        first_photo = photo_urls[0]
-        
-        try:
-            # Скачиваем первую фотографию
-            response = self.session.get(first_photo, timeout=10)
-            if response.status_code != 200:
-                return self.send_message(caption)
-            
-            files = {'photo': ('image.jpg', response.content, 'image/jpeg')}
-            data = {
-                'chat_id': self.channel,
-                'caption': caption,
-                'parse_mode': 'HTML'
-            }
-            
-            # Отправляем первую фото с подписью
-            url = f'https://api.telegram.org/bot{self.token}/sendPhoto'
-            response = self.session.post(url, files=files, data=data, timeout=30)
-            
-            if response.status_code == 200 and len(photo_urls) > 1:
-                # Отправляем остальные фото
-                for photo_url in photo_urls[1:3]:  # Максимум 3 фото
-                    try:
-                        photo_response = self.session.get(photo_url, timeout=10)
-                        if photo_response.status_code == 200:
-                            files = {'photo': ('image.jpg', photo_response.content, 'image/jpeg')}
-                            data = {'chat_id': self.channel}
-                            self.session.post(url, files=files, data=data, timeout=30)
-                            time.sleep(1)
-                    except:
-                        continue
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error sending photos: {e}")
-            return self.send_message(caption)
-    
-    def send_message(self, text):
-        """Отправляет текстовое сообщение"""
-        url = f'https://api.telegram.org/bot{self.token}/sendMessage'
-        data = {
-            'chat_id': self.channel,
-            'text': text,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': False
+        self.base = f"https://api.telegram.org/bot{self.token}"
+
+    def send_message(self, text, disable_preview=False):
+        url = f"{self.base}/sendMessage"
+        payload = {
+            "chat_id": self.channel,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": disable_preview
         }
-        
         try:
-            response = self.session.post(url, json=data, timeout=30)
-            return response.status_code == 200
+            r = requests.post(url, json=payload, timeout=25)
+            r.raise_for_status()
+            return True
         except Exception as e:
-            logger.error(f"Error sending message: {e}")
+            logger.error("Telegram send_message failed: %s", e)
             return False
 
-class FashionNewsBot:
-    def __init__(self):
-        self.db = DatabaseManager()
-        self.extractor = SmartContentExtractor()
-        self.publisher = TelegramPublisher(BOT_TOKEN, CHANNEL)
-        self.post_creator = PostCreator()
-        self.translator = ContentProcessor()
-    
-    def check_sources(self):
-        """Проверяет все источники на новые новости"""
-        all_news = []
-        
-        for source in SOURCES:
-            try:
-                logger.info(f"🔍 Checking {source['name']}...")
-                news_items = self.parse_feed(source)
-                all_news.extend(news_items)
-                time.sleep(2)
-            except Exception as e:
-                logger.error(f"Error parsing {source['name']}: {e}")
-                continue
-        
-        return all_news
-    
-    def parse_feed(self, source):
-        """Парсит RSS фид источника"""
-        news_items = []
-        
+    def send_photos_group(self, caption, photos):
+        # Если нет фото, отправляем как текст
+        if not photos:
+            return self.send_message(caption, disable_preview=False)
+
+        # Отправляем первую фото с подписью
+        first = photos[0]
         try:
-            feed = feedparser.parse(source['url'])
-            
-            for entry in feed.entries[:15]:  # Берем 15 последних записей
-                if self.is_recent(entry) and self.is_fashion_related(entry):
-                    news_item = {
-                        'title': entry.title,
-                        'url': entry.link,
-                        'source': source['name'],
-                        'published': getattr(entry, 'published', ''),
-                        'summary': getattr(entry, 'summary', '')[:300]
-                    }
-                    news_items.append(news_item)
-                    
-        except Exception as e:
-            logger.error(f"Error parsing feed {source['name']}: {e}")
-        
-        return news_items
-    
-    def is_recent(self, entry, max_hours=24):
-        """Проверяет, свежая ли новость"""
-        try:
-            date_str = getattr(entry, 'published', '')
-            if not date_str:
-                return True
-                
-            formats = [
-                '%a, %d %b %Y %H:%M:%S %Z',
-                '%a, %d %b %Y %H:%M:%S %z',
-                '%Y-%m-%dT%H:%M:%SZ'
-            ]
-            
-            for fmt in formats:
+            resp = requests.get(first, timeout=15)
+            resp.raise_for_status()
+            files = {"photo": ("image.jpg", resp.content, "image/jpeg")}
+            data = {"chat_id": self.channel, "caption": caption, "parse_mode": "HTML"}
+            send_url = f"{self.base}/sendPhoto"
+            r = requests.post(send_url, files=files, data=data, timeout=30)
+            r.raise_for_status()
+            # Отправляем остальные маленькими фото (если есть)
+            for p in photos[1:3]:
                 try:
-                    news_date = datetime.strptime(date_str, fmt)
-                    time_diff = datetime.now() - news_date
-                    return time_diff.total_seconds() / 3600 <= max_hours
-                except:
+                    r2 = requests.get(p, timeout=12)
+                    r2.raise_for_status()
+                    files = {"photo": ("image.jpg", r2.content, "image/jpeg")}
+                    data = {"chat_id": self.channel}
+                    requests.post(send_url, files=files, data=data, timeout=25)
+                    time.sleep(1)
+                except Exception:
                     continue
-                    
             return True
-        except:
-            return True
-    
-    def is_fashion_related(self, entry):
-        """Проверяет, относится ли новость к моде"""
-        content = f"{entry.title} {getattr(entry, 'summary', '')}".lower()
-        
-        fashion_keywords = [
-            'sneaker', 'collection', 'collaboration', 'release', 'drop',
-            'fashion', 'streetwear', 'luxury', 'designer', 'boot',
-            'jacket', 'hoodie', 'shoe', 'apparel', 'capsule'
-        ]
-        
-        return any(keyword in content for keyword in fashion_keywords)
-    
-    def process_news(self, news_item):
-        """Обрабатывает новость и создает пост"""
-        if self.db.is_news_sent(news_item['url']):
-            return None
-        
-        logger.info(f"📝 Processing: {news_item['title']}")
-        
-        # Извлекаем качественный контент
-        content, images = self.extractor.extract_quality_content(news_item['url'])
-        
-        if not content:
-            content = news_item['summary']
-        
-        # Переводим и улучшаем
-        translated_title = self.translator.smart_translate(news_item['title'])
-        translated_content = self.translator.smart_translate(content)
-        
-        # Создаем чистый пост
-        post = self.post_creator.create_clean_post(
-            translated_title, 
-            translated_content, 
-            news_item['source'],
-            len(images)
-        )
-        
-        # Помечаем как отправленную
-        self.db.mark_news_sent(news_item['url'], news_item['source'], news_item['title'])
-        
-        return post, images
-    
-    def run(self):
-        """Запускает бота"""
-        logger.info("🚀 Starting Smart Fashion News Bot")
-        
-        # Проверяем источники
-        all_news = self.check_sources()
-        logger.info(f"📰 Found {len(all_news)} new news items")
-        
-        # Обрабатываем и публикуем каждую новость
-        success_count = 0
-        for news_item in all_news:
-            try:
-                result = self.process_news(news_item)
-                if result:
-                    post, images = result
-                    
-                    # Публикуем пост
-                    success = self.publisher.send_photo_group(post, images)
-                    
-                    if success:
-                        success_count += 1
-                        logger.info(f"✅ Published: {news_item['title'][:50]}...")
-                    else:
-                        logger.error(f"❌ Failed to publish: {news_item['title'][:50]}...")
-                    
-                    # Задержка между постами
-                    if success_count < 3:  # Максимум 3 поста за раз
-                        time.sleep(10)
-                    else:
-                        break
-                    
-            except Exception as e:
-                logger.error(f"❌ Error processing news: {e}")
-                continue
-        
-        logger.info(f"🎉 Published {success_count} news items")
+        except Exception as e:
+            logger.error("Failed to send photos: %s", e)
+            return self.send_message(caption)
+
+
+# --------- Основной поток ---------
+def collect_candidates():
+    candidates = []
+    for src in SOURCES:
+        name = src["name"]
+        # Сначала пробуем RSS
+        if src.get("rss"):
+            ritems = fetch_rss_items(src["rss"], name, max_items=12)
+            if ritems:
+                for it in ritems:
+                    it["base_url"] = src.get("base_url")
+                candidates.extend(ritems)
+                continue  # RSS дал список — используем его
+        # RSS пуст или отсутствует — парсим листинг
+        lit = fetch_html_list(src["list_url"], src["base_url"], name, max_items=12)
+        candidates.extend(lit)
+    return candidates
+
+
+def pick_best(candidates, sent_set, max_count=MAX_SEND):
+    # Оцениваем и сортируем по score и по source priority (порядок в SOURCES)
+    source_priority = {s["name"]: i for i, s in enumerate(SOURCES)}
+    for c in candidates:
+        c["_score"] = score_item(c)
+        c["_priority"] = source_priority.get(c.get("source"), 99)
+    # Сортируем: 1) по score desc, 2) по приоритет источника asc, 3) по свежести (если есть)
+    candidates.sort(key=lambda x: (-x["_score"], x["_priority"]))
+    selected = []
+    used_event_signatures = set()  # для предотвращения пересечений схожих заголовков
+    for c in candidates:
+        if len(selected) >= max_count:
+            break
+        url = c.get("url")
+        if not url:
+            continue
+        h = hash_url(url)
+        if h in sent_set:
+            continue
+        # event signature: нормализованный заголовок + первые 20 символов URL path
+        title_sig = (c.get("title") or "").lower().strip()
+        path = urlparse(url).path
+        sig = title_sig[:80] + "|" + path[:40]
+        if any(title_sig in s or s in title_sig for s in used_event_signatures):
+            # похожая новость уже выбрана — пропускаем, чтобы избежать дубля
+            continue
+        used_event_signatures.add(title_sig)
+        selected.append(c)
+    return selected
+
+
+def build_post(item):
+    title = item.get("title") or ""
+    source = item.get("source") or ""
+    url = item.get("url") or ""
+    base_url = item.get("base_url") or urlparse(url).scheme + "://" + urlparse(url).netloc
+    # Извлекаем контент и картинки (умеренно)
+    content, images = extract_article_content(url, base_url)
+    if not content:
+        content = item.get("summary") or ""
+
+    # Перевод (если есть ключ)
+    if DEEPL_KEY:
+        title_ru = deepl_translate(title, target_lang="RU")
+        content_ru = deepl_translate(content, target_lang="RU")
+    else:
+        title_ru = title
+        content_ru = content
+
+    # Создаём HTML-подпись
+    excerpt = short_text(content_ru or content, limit=600)
+    post = f"<b>{title_ru}</b>\n\n{excerpt}\n\n📰 Источник: {source}\n🔗 {url}"
+
+    return post, images
+
+
+def commit_sent_file_if_changed():
+    """Этот скрипт не коммитит — коммит делается в workflow после выполнения.
+       Но оставляем функцию как заглушку (можно расширить)."""
+    pass
+
+
+def main():
+    if not BOT_TOKEN or not CHANNEL:
+        logger.error("BOT_TOKEN and CHANNEL environment variables must be set.")
+        return
+
+    logger.info("Starting collector")
+    sent = load_sent()
+    candidates = collect_candidates()
+    logger.info("Candidates collected: %d", len(candidates))
+
+    selected = pick_best(candidates, sent, max_count=MAX_SEND)
+    logger.info("Selected to send: %d", len(selected))
+
+    publisher = TelegramPublisher(BOT_TOKEN, CHANNEL)
+    sent_now = set()
+
+    for item in selected:
+        try:
+            post, images = build_post(item)
+            ok = publisher.send_photos_group(post, images)
+            if ok:
+                logger.info("Published: %s", item.get("title"))
+                sent_now.add(hash_url(item.get("url")))
+                # небольшая пауза между публикациями
+                time.sleep(2)
+            else:
+                logger.error("Failed publishing: %s", item.get("title"))
+        except Exception as e:
+            logger.exception("Error processing item: %s", e)
+
+    if sent_now:
+        logger.info("Saving sent list (%d new)", len(sent_now))
+        sent.update(sent_now)
+        save_sent(sent)
+    else:
+        logger.info("No new items sent")
+
+    logger.info("Done.")
+
 
 if __name__ == "__main__":
-    bot = FashionNewsBot()
-    bot.run()
-    logger.info("✅ Bot finished!")
+    main()
