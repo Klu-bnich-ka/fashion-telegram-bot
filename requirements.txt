@@ -3,3 +3,4 @@ requests==2.31.0
 lxml==4.9.3
 feedparser==6.0.10
 googletrans==4.0.0-rc1
+
