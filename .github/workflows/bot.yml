@@ -2,13 +2,17 @@ name: Fashion News Bot
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # Каждые 30 минут
+    - cron: '*/30 * * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write  # Разрешаем боту сохранять изменения в репозиторий
 
 jobs:
   send-news:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -28,3 +32,10 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHANNEL: ${{ secrets.CHANNEL }}
         run: python bot.py
+
+      # ЭТОТ ШАГ СОХРАНЯЕТ БАЗУ ДАННЫХ
+      - name: Commit and push DB changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 Update news database [skip ci]"
+          file_pattern: 'news.db'
