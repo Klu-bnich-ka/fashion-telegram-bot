@@ -1,8 +1,8 @@
 """
-Fashion News Bot - The Final Fix: Strict Image Enforcement
+Fashion News Bot - Final Fix: Double Filter (Keywords + Stopwords)
 Author: Gemini AI
-Version: 4.0 (The Image Enforcer)
-Description: Ensures no post is sent without at least one valid image link.
+Version: 5.0 (The Fashion Purist)
+Description: Strict content filtering to ensure relevance only to fashion houses, drops, and clothing.
 """
 
 import os
@@ -35,20 +35,27 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 CHANNEL = os.environ.get('CHANNEL')
 DB_NAME = 'news.db'
 
-# Список надежных RSS лент для моды
+# <--- ИЗМЕНЕНИЕ 1: СУЖЕНИЕ ИСТОЧНИКОВ --->
+# Убираем Guardian Fashion, так как это общий новостной сайт.
 RSS_SOURCES = [
     {'name': 'Vogue', 'url': 'https://www.vogue.com/feed/rss'},
     {'name': 'Fashionista', 'url': 'https://fashionista.com/.rss/full/'},
     {'name': 'Hypebeast', 'url': 'https://hypebeast.com/fashion/feed'},
-    {'name': 'Guardian Fashion', 'url': 'https://www.theguardian.com/fashion/rss'}
 ]
 
-# Ключевые слова для фильтрации новостей
+# Ключевые слова для ПОЛОЖИТЕЛЬНОГО фильтра (ОБЯЗАНЫ присутствовать)
 FASHION_KEYWORDS = [
     'fashion house', 'collaboration', 'collab', 'clothing', 
     'drop', 'collection', 'brand', 'designer', 'runway', 
     'couture', 'ready-to-wear', 'capsule', 'sneaker', 'apparel',
     'мода', 'дроп', 'коллекция', 'бренд', 'дизайнер', 'одежда', 'кроссовки'
+]
+
+# <--- ИЗМЕНЕНИЕ 2: СТОП-СЛОВА (НЕ ДОЛЖНЫ присутствовать) --->
+STOP_KEYWORDS = [
+    'music', 'gaming', 'film', 'movie', 'tv show', 'video game', 
+    'soundtrack', 'album', 'podcast', 'technology', 'криптовалюта', 
+    'музыка', 'фильм', 'сериал', 'видеоигра', 'технологии'
 ]
 
 @dataclass
@@ -117,7 +124,7 @@ class TranslatorService:
             logger.error(f"Translation error: {e}")
             return text
 
-# ================= 4. CONTENT EXTRACTOR (THE IMAGE ENFORCER) =================
+# ================= 4. CONTENT EXTRACTOR =================
 class Extractor:
     def __init__(self):
         self.ua = UserAgent()
@@ -159,7 +166,7 @@ class Extractor:
     def _find_all_images(self, soup: BeautifulSoup, url: str) -> Set[str]:
         images: Set[str] = set()
         
-        # 1. Поиск в мета-тегах (самый надежный способ найти главное фото)
+        # 1. Поиск в мета-тегах
         og_image = soup.find('meta', property='og:image')
         if og_image and og_image.get('content'):
             clean_src = self._clean_image_url(og_image['content'], url)
@@ -191,11 +198,9 @@ class Extractor:
                     clean_src = self._clean_image_url(src, url)
                     if clean_src: images.add(clean_src)
             
-            # 4. <--- НОВЫЙ ПОИСК: Поиск изображений в фоновых стилях (background-image) --->
-            # Ищем любые теги, которые могут иметь фон (div, section)
+            # 4. Поиск изображений в фоновых стилях (background-image)
             for tag in article_body.find_all(lambda tag: tag.has_attr('style') and 'background-image' in tag['style']):
                 style = tag['style']
-                # Извлекаем URL из style="...url('...')"
                 match = re.search(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', style)
                 if match:
                     src = match.group(1)
@@ -254,7 +259,7 @@ class TelegramSender:
                 
                 logger.warning(f"Failed to send media group. Status: {r.status_code}")
             
-            # Фолбек: Отправка только текста (только если не было картинок или MediaGroup не сработала)
+            # Фолбек: Отправка только текста
             data = {'chat_id': CHANNEL, 'text': caption, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
             r = requests.post(f"{self.api}/sendMessage", json=data)
             return r.status_code == 200
@@ -263,10 +268,22 @@ class TelegramSender:
             logger.error(f"Telegram send critical error: {e}")
             return False
 
-# ================= 6. MAIN CONTROLLER (THE IMAGE ENFORCER) =================
+# ================= 6. MAIN CONTROLLER (THE FASHION PURIST) =================
 def is_relevant(title: str) -> bool:
+    """Проверяет релевантность, используя двойной фильтр: ОБЯЗАТЕЛЬНОЕ слово + ОТСУТСТВИЕ стоп-слова."""
     check_text = title.lower()
-    return any(k in check_text for k in FASHION_KEYWORDS)
+    
+    # Шаг 1: Проверка на наличие хотя бы одного ключевого слова (позитивный фильтр)
+    has_fashion_keyword = any(k in check_text for k in FASHION_KEYWORDS)
+    if not has_fashion_keyword:
+        return False
+    
+    # Шаг 2: Проверка на отсутствие стоп-слов (негативный фильтр)
+    has_stop_word = any(k in check_text for k in STOP_KEYWORDS)
+    if has_stop_word:
+        return False
+        
+    return True
 
 def run():
     logger.info("🚀 Bot started (Final Enterprise Run)")
@@ -297,11 +314,12 @@ def run():
                 
                 if db.exists(url): continue
                 
+                # <--- ДВОЙНАЯ ФИЛЬТРАЦИЯ ---
                 if not is_relevant(title):
-                    logger.info(f"Title '{title}' is not relevant to drops/collabs. Skipping.")
+                    logger.info(f"Title '{title}' is not strictly relevant. Skipping.")
                     continue
                 
-                logger.info(f"Found relevant news: {title}")
+                logger.info(f"Found strictly relevant news: {title}")
                 
                 # 1. Извлечение контента и картинок
                 site_text, site_images = extractor.get_full_content(url)
@@ -312,7 +330,7 @@ def run():
                     logger.info("Content too short, skipping")
                     continue
                 
-                # <--- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: НЕ ОТПРАВЛЯЕМ БЕЗ КАРТИНКИ --->
+                # <--- ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА НА КАРТИНКУ ---
                 if not site_images:
                     logger.warning(f"🚨 Image not found for {title}. Skipping post.")
                     continue
