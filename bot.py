@@ -1,8 +1,8 @@
 """
-Fashion News Bot - Final Enterprise-Grade Version
+Fashion News Bot - The Final Fix: Strict Image Enforcement
 Author: Gemini AI
-Version: 3.0 (The Image Hunter)
-Description: Stable RSS parsing with aggressive content filtering and multi-level image extraction.
+Version: 4.0 (The Image Enforcer)
+Description: Ensures no post is sent without at least one valid image link.
 """
 
 import os
@@ -59,14 +59,12 @@ class Article:
     images: List[str]
     source: str
 
-# Проверка переменных окружения
 if not BOT_TOKEN or not CHANNEL:
     logger.critical("❌ FATAL: BOT_TOKEN or CHANNEL not found in env vars.")
     exit(1) 
 
 # ================= 2. DATABASE LAYER =================
 class Database:
-    """Обработчик базы данных для хранения истории публикаций."""
     def __init__(self):
         self.conn = sqlite3.connect(DB_NAME)
         self.cursor = self.conn.cursor()
@@ -80,13 +78,11 @@ class Database:
         self.conn.commit()
 
     def exists(self, url: str) -> bool:
-        """Проверяет, была ли новость с этим URL уже опубликована."""
         h = hashlib.md5(url.encode()).hexdigest()
         res = self.cursor.execute('SELECT 1 FROM history WHERE hash = ?', (h,)).fetchone()
         return res is not None
 
     def add(self, url: str, title: str):
-        """Добавляет новость в историю."""
         h = hashlib.md5(url.encode()).hexdigest()
         try:
             self.cursor.execute('INSERT OR IGNORE INTO history (hash, title) VALUES (?, ?)', (h, title))
@@ -96,7 +92,6 @@ class Database:
 
 # ================= 3. TOOLS: SANITIZER & TRANSLATOR =================
 class TextSanitizer:
-    """Очистка текста от служебных фраз и HTML-тегов."""
     @staticmethod
     def clean(text: str) -> str:
         if not text: return ""
@@ -109,12 +104,10 @@ class TextSanitizer:
         return text
 
 class TranslatorService:
-    """Сервис перевода через Google Translator."""
     def __init__(self):
         self.translator = GoogleTranslator(source='auto', target='ru')
 
     def translate(self, text: str) -> str:
-        """Переводит текст с паузой для стабильности."""
         try:
             if not text: return ""
             if len(text) > 4000: text = text[:4000]
@@ -124,16 +117,14 @@ class TranslatorService:
             logger.error(f"Translation error: {e}")
             return text
 
-# ================= 4. CONTENT EXTRACTOR (THE IMAGE HUNTER) =================
+# ================= 4. CONTENT EXTRACTOR (THE IMAGE ENFORCER) =================
 class Extractor:
-    """Извлекает текст и изображения из статьи с агрессивным поиском фото."""
     def __init__(self):
         self.ua = UserAgent()
         self.session = requests.Session()
         self.sanitizer = TextSanitizer()
 
     def _get_article_soup(self, url: str) -> Optional[BeautifulSoup]:
-        """Загружает страницу и удаляет мусорные блоки."""
         try:
             headers = {'User-Agent': self.ua.random, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9'}
             resp = self.session.get(url, headers=headers, timeout=15)
@@ -150,18 +141,14 @@ class Extractor:
             return None
 
     def _clean_image_url(self, src: str, base_url: str) -> Optional[str]:
-        """Нормализует, чистит и проверяет URL изображения."""
         if not src: return None
         
-        # Если это srcset, берем первую (самую большую) ссылку
         if ' ' in src and ',' in src: 
             src = src.split(',')[0].strip().split(' ')[0]
         
-        # Нормализация протокола
         if src.startswith('//'): src = 'https:' + src
         if not src.startswith('http'): src = urljoin(base_url, src)
 
-        # Фильтр мусора и проверка формата
         if any(x in src.lower() for x in ['logo', 'icon', 'avatar', 'svg', 'thumb', 'small', 'ads', 'gif']):
             return None
         if not src.endswith(('.jpg', '.jpeg', '.png', '.webp', '.avif')):
@@ -170,17 +157,15 @@ class Extractor:
         return src
 
     def _find_all_images(self, soup: BeautifulSoup, url: str) -> Set[str]:
-        """<-- САМЫЙ ВАЖНЫЙ БЛОК: МНОГОУРОВНЕВЫЙ ПОИСК КАРТИНОК -->"""
         images: Set[str] = set()
         
         # 1. Поиск в мета-тегах (самый надежный способ найти главное фото)
-        # og:image (Facebook/Open Graph)
         og_image = soup.find('meta', property='og:image')
         if og_image and og_image.get('content'):
             clean_src = self._clean_image_url(og_image['content'], url)
             if clean_src: images.add(clean_src)
 
-        # 2. Поиск в JSON-LD (Schema.org, часто используется Google)
+        # 2. Поиск в JSON-LD (Schema.org)
         try:
             scripts = soup.find_all('script', type='application/ld+json')
             for script in scripts:
@@ -199,19 +184,27 @@ class Extractor:
         # 3. Агрессивный поиск в HTML-теле статьи
         article_body = soup.find('article') or soup.find('main') or soup.body
         if article_body:
-            # Селекторы, которые ищут изображения во всех возможных местах
             img_tags = article_body.select('picture img, figure img, img[data-src], img[srcset], img')
-            
             for tag in img_tags:
                 src = tag.get('data-src') or tag.get('srcset') or tag.get('src')
                 if src:
+                    clean_src = self._clean_image_url(src, url)
+                    if clean_src: images.add(clean_src)
+            
+            # 4. <--- НОВЫЙ ПОИСК: Поиск изображений в фоновых стилях (background-image) --->
+            # Ищем любые теги, которые могут иметь фон (div, section)
+            for tag in article_body.find_all(lambda tag: tag.has_attr('style') and 'background-image' in tag['style']):
+                style = tag['style']
+                # Извлекаем URL из style="...url('...')"
+                match = re.search(r'url\([\'"]?([^\'"\)]+)[\'"]?\)', style)
+                if match:
+                    src = match.group(1)
                     clean_src = self._clean_image_url(src, url)
                     if clean_src: images.add(clean_src)
                     
         return images
 
     def get_full_content(self, url: str) -> Tuple[Optional[str], List[str]]:
-        """Извлекает текст (сокращено до 3 абзацев) и изображения из статьи."""
         soup = self._get_article_soup(url)
         if not soup: return None, []
         
@@ -227,7 +220,6 @@ class Extractor:
         # 2. Поиск картинок
         raw_images = self._find_all_images(soup, url)
         
-        # 3. Выборка: берем не более 3 изображений
         final_images = list(raw_images)[:3]
         logger.info(f"🖼️ Successfully extracted {len(final_images)} images from {url}")
         
@@ -235,15 +227,12 @@ class Extractor:
 
 # ================= 5. TELEGRAM SENDER =================
 class TelegramSender:
-    """Отправка сообщения в Telegram с поддержкой фотоальбомов."""
     def __init__(self):
         self.api = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
     def send(self, article: Article) -> bool:
-        """Отправляет статью (фото + текст или только текст)."""
         caption = f"<b>{article.title}</b>\n\n{article.content}"
         
-        # Ограничение длины подписи
         MAX_CAPTION_LENGTH = 700 
         if len(caption) > MAX_CAPTION_LENGTH: 
             caption = caption[:(MAX_CAPTION_LENGTH - 4)] + "..."
@@ -251,7 +240,6 @@ class TelegramSender:
         try:
             if article.images:
                 media = []
-                # Формируем медиа-группу
                 for i, img in enumerate(article.images):
                     item = {'type': 'photo', 'media': img}
                     if i == 0: 
@@ -259,15 +247,14 @@ class TelegramSender:
                         item['parse_mode'] = 'HTML'
                     media.append(item)
                 
-                # Попытка отправки фотоальбома
                 r = requests.post(f"{self.api}/sendMediaGroup", json={'chat_id': CHANNEL, 'media': media})
                 if r.status_code == 200: 
                     logger.info("Sent via MediaGroup successfully.")
                     return True
                 
-                logger.warning(f"Failed to send media group. Trying text fallback. Status: {r.status_code}")
+                logger.warning(f"Failed to send media group. Status: {r.status_code}")
             
-            # Фолбек: Отправка только текста
+            # Фолбек: Отправка только текста (только если не было картинок или MediaGroup не сработала)
             data = {'chat_id': CHANNEL, 'text': caption, 'parse_mode': 'HTML', 'disable_web_page_preview': True}
             r = requests.post(f"{self.api}/sendMessage", json=data)
             return r.status_code == 200
@@ -276,9 +263,8 @@ class TelegramSender:
             logger.error(f"Telegram send critical error: {e}")
             return False
 
-# ================= 6. MAIN CONTROLLER =================
+# ================= 6. MAIN CONTROLLER (THE IMAGE ENFORCER) =================
 def is_relevant(title: str) -> bool:
-    """Проверяет, соответствует ли заголовок теме моды/дропов."""
     check_text = title.lower()
     return any(k in check_text for k in FASHION_KEYWORDS)
 
@@ -305,14 +291,12 @@ def run():
                 logger.warning(f"Empty feed for {source['name']}")
                 continue
 
-            # Проверяем до 5 свежих новостей, чтобы найти релевантную
             for entry in feed.entries[:5]: 
                 url = entry.link
                 title = entry.title
                 
                 if db.exists(url): continue
                 
-                # Фильтрация по теме
                 if not is_relevant(title):
                     logger.info(f"Title '{title}' is not relevant to drops/collabs. Skipping.")
                     continue
@@ -327,7 +311,12 @@ def run():
                 if len(content_en) < 150: 
                     logger.info("Content too short, skipping")
                     continue
-
+                
+                # <--- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: НЕ ОТПРАВЛЯЕМ БЕЗ КАРТИНКИ --->
+                if not site_images:
+                    logger.warning(f"🚨 Image not found for {title}. Skipping post.")
+                    continue
+                
                 # 2. Перевод
                 logger.info("Translating...")
                 title_ru = translator_service.translate(title)
@@ -339,7 +328,7 @@ def run():
                     logger.info("✅ Article published successfully!")
                     db.add(url, title)
                     news_sent += 1
-                    break # Переходим к следующему запуску
+                    break 
                 else:
                     logger.error("❌ Failed to send article data.")
                 
