@@ -3,3 +3,4 @@ beautifulsoup4==4.12.2
 lxml==4.9.3
 deep-translator==1.11.4
 fake-useragent==1.4.0
+feedparser==6.0.10
