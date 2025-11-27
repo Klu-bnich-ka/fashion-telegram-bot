@@ -2,5 +2,4 @@ beautifulsoup4==4.12.2
 requests==2.31.0
 lxml==4.9.3
 feedparser==6.0.10
-googletrans==4.0.0-rc1
-
+deep-translator==1.11.4
